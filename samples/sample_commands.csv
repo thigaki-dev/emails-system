@@ -1,0 +1,8 @@
+command_id,created_at,account_id,action,gmail_message_id,gmail_thread_id,search_query,label_name,status,requested_by,processed_at,result,error
+,2026-01-01T00:00:00Z,personal,SYNC_NOW,,,,,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,school,MARK_READ,,,in:inbox newer_than:1d is:unread,,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,research,LABEL,,,subject:ASBH,Research/ASBH,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,school,ARCHIVE,<PASTE_GMAIL_MESSAGE_ID_HERE>,,,,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,personal,FETCH_FULL_TEXT,<PASTE_GMAIL_MESSAGE_ID_HERE>,,,,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,personal,CLEAR_FULL_TEXT,<PASTE_GMAIL_MESSAGE_ID_HERE>,,,,PENDING,ChatGPT,,,
+,2026-01-01T00:00:00Z,research,TRASH,<PASTE_GMAIL_MESSAGE_ID_HERE>,,,,PENDING,ChatGPT,,,
