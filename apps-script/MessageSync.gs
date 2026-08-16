@@ -293,7 +293,21 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
     labels = userLabels.map(function (l) {
       return l.getName();
     });
-    // Include system-ish state hints via unread/starred flags rather than raw system labels
+    // Synthetic system-state tags (GmailApp user labels omit Inbox/Archive/Trash)
+    try {
+      if (thread.isInInbox()) {
+        labels.push('INBOX');
+      } else if (thread.isInTrash()) {
+        labels.push('TRASH');
+      } else {
+        labels.push('ARCHIVED');
+      }
+      if (thread.isInSpam()) {
+        labels.push('SPAM');
+      }
+    } catch (stateErr) {
+      // older runtimes / unexpected thread state — ignore
+    }
   }
 
   var bodyText = '';
