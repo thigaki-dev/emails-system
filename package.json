@@ -1,0 +1,9 @@
+{
+  "name": "emails-system",
+  "private": true,
+  "description": "Multi-account Gmail control via ChatGPT + Google Apps Script (no OpenAI API)",
+  "scripts": {
+    "test": "node tests/validate_prd.js",
+    "validate": "node tests/validate_prd.js"
+  }
+}
