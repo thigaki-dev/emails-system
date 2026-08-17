@@ -7,15 +7,17 @@ var ACCOUNT_HEADERS = ['account_id', 'email_address', 'display_name', 'enabled']
 var SETTINGS_HEADERS = ['key', 'value', 'description'];
 
 var DEFAULT_SETTINGS_ROWS = [
-  ['DRY_RUN', 'FALSE', 'When TRUE, log intended Gmail actions without modifying mail.'],
+  ['DRY_RUN', 'TRUE', 'Safe default: log intended Gmail actions without modifying mail. Set FALSE only after you inspect Audit_Log.'],
   ['TRASH_ENABLED', 'FALSE', 'When FALSE, TRASH commands fail safely.'],
-  ['AUTO_CREATE_LABELS', 'TRUE', 'Create missing user labels on LABEL actions.'],
+  ['AUTO_CREATE_LABELS', 'TRUE', 'Create missing user labels on LABEL actions (thread-level).'],
   ['MAX_COMMANDS_PER_RUN', '25', 'Cap on commands processed per processPendingCommands run.'],
   ['COMMAND_POLL_MINUTES', '5', 'Minutes between command-processor triggers.'],
   ['SYNC_LOOKBACK_DAYS', '30', 'How far back message sync looks by default.'],
   ['SYNC_POLL_MINUTES', '15', 'Minutes between message-sync triggers.'],
   ['MAX_MESSAGES_PER_SYNC', '200', 'Cap on messages upserted per sync run.'],
+  ['MAX_RECONCILE_PER_SYNC', '200', 'Cap on existing Messages rows refreshed for archive/delete state per sync.'],
   ['BODY_SYNC_POLICY', 'SNIPPET_ONLY', 'NONE | SNIPPET_ONLY | FULL_TEXT'],
+  ['FULL_TEXT_TTL_HOURS', '24', 'Automatically clear Messages.body_text this many hours after FETCH_FULL_TEXT.'],
   ['MESSAGE_RETENTION_DAYS', '60', 'Prune Messages rows older than this many days.']
 ];
 

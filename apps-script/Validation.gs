@@ -16,6 +16,19 @@ function isInfraAction_(action) {
 }
 
 /**
+ * Returns 'message' or 'thread'. Thread-level actions affect every message
+ * in the Gmail thread even when the command names a single gmail_message_id.
+ */
+function actionScope_(action) {
+  var a = String(action || '').trim().toUpperCase();
+  return CONFIG.ACTION_SCOPE[a] || 'message';
+}
+
+function isThreadLevelAction_(action) {
+  return actionScope_(action) === 'thread';
+}
+
+/**
  * Validate that the command's account_id matches this deployment and that the
  * account is listed/enabled in the Accounts registry.
  */

@@ -48,11 +48,11 @@ Example: the script authorized while signed into `school@example.edu` should use
 6. **Set** `ACCOUNT_ID`, `ACCOUNT_EMAIL`, and `CONTROL_SHEET_ID` in `Config.gs`.
 7. **Authorize** Gmail and Google Sheets permissions when Apps Script prompts you.
 8. **Run `setupSystem()`** from the editor (select function → Run). This creates tabs: `Accounts`, `Messages`, `Commands`, `Audit_Log`, `Settings`, and installs triggers.
-9. **Run a dry-run test** via `runDryRunTest()`. Confirm `Commands` / `Audit_Log` update and that Gmail is unchanged while `DRY_RUN` is in effect.
+9. **Run a dry-run test** via `runDryRunTest()`. Confirm `Commands` / `Audit_Log` update and that Gmail is unchanged. **`DRY_RUN` defaults to TRUE** so live mutations are off until you opt in.
 10. **Confirm the time-driven triggers** exist (Triggers in the left sidebar): `processPendingCommands` (~every 5 min) and `scheduledMessageSync` (~every 15 min). `setupSystem()` already installs them; use `recreateTriggers()` / `removeAllTriggers()` to change them.
 11. **Repeat steps 4–10 for every additional Gmail account** (new Apps Script project while signed into that account, same code, different `ACCOUNT_ID` / `ACCOUNT_EMAIL`).
 12. **Share the control Sheet** with every account that needs to execute commands (Edit access).
-13. **Test one harmless `MARK_READ` or `LABEL` command** for each account (with `DRY_RUN=FALSE`) before enabling archive/trash actions. Keep `TRASH_ENABLED=FALSE` until you are ready.
+13. **Inspect Audit_Log**, then set `DRY_RUN` to **FALSE** in the Settings tab. Test one harmless `MARK_READ` command for each account before enabling archive/trash. Keep `TRASH_ENABLED=FALSE` until you are ready.
 
 Optional: [clasp](https://github.com/google/clasp) users can push from `apps-script/` after `clasp login` / `clasp create` / linking the script project.
 
@@ -96,9 +96,22 @@ Created automatically by `setupSystem()`:
 
 ### Messages columns
 
-`sync_id`, `account_id`, `account_email`, `gmail_message_id`, `gmail_thread_id`, `received_at`, `from_address`, `to_addresses`, `cc_addresses`, `subject`, `snippet`, `body_text`, `labels`, `is_unread`, `is_starred`, `has_attachments`, `attachment_names`, `last_synced_at`, `sync_state`
+`sync_id`, `account_id`, `account_email`, `gmail_message_id`, `gmail_thread_id`, `received_at`, `from_address`, `to_addresses`, `cc_addresses`, `subject`, `snippet`, `body_text`, `body_text_expires_at`, `labels`, `is_unread`, `is_starred`, `has_attachments`, `attachment_names`, `last_synced_at`, `sync_state`
 
-Default sync: last **30 days**, priority Inbox/unread/starred, body policy **`SNIPPET_ONLY`**, no attachment binaries. ChatGPT can request `FETCH_FULL_TEXT` for one message when needed.
+Default sync: last **30 days**, priority Inbox/unread/starred, body policy **`SNIPPET_ONLY`**, no attachment binaries. ChatGPT can request `FETCH_FULL_TEXT` for one message when needed. Stored full text expires automatically after **24 hours** (`FULL_TEXT_TTL_HOURS`) even without `CLEAR_FULL_TEXT`.
+
+### Action scope (read this before enqueueing commands)
+
+GmailApp is thread-oriented for some operations. A command may name one `gmail_message_id` and still affect the whole thread.
+
+| Action | Scope | What actually changes |
+|---|---|---|
+| `MARK_READ`, `MARK_UNREAD`, `STAR`, `UNSTAR` | **message** | Only the targeted message |
+| `TRASH` | **message** | Only the targeted message (still gated by `TRASH_ENABLED`) |
+| `LABEL`, `REMOVE_LABEL` | **thread** | Every message in that thread receives/loses the label |
+| `ARCHIVE`, `MOVE_TO_INBOX` | **thread** | The whole thread leaves or re-enters Inbox |
+
+Do not tell the user that `LABEL`/`ARCHIVE` apply to “this one message” when the thread has multiple messages. Command results and `Audit_Log.scope` record `message` or `thread`.
 
 ---
 
@@ -106,9 +119,10 @@ Default sync: last **30 days**, priority Inbox/unread/starred, body policy **`SN
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `DRY_RUN` | **TRUE** | Log intended actions only. Turn FALSE after you inspect Audit_Log. |
 | `TRASH_ENABLED` | FALSE | Trash commands fail until you opt in |
-| `DRY_RUN` | FALSE | When TRUE, log intended actions only |
-| `AUTO_CREATE_LABELS` | TRUE | Create missing labels on `LABEL` |
+| `AUTO_CREATE_LABELS` | TRUE | Create missing labels on `LABEL` (thread-level) |
+| `FULL_TEXT_TTL_HOURS` | 24 | Auto-clear `Messages.body_text` after FETCH_FULL_TEXT |
 | Permanent delete | never | Out of scope |
 | Ambiguous `search_query` | NEEDS_REVIEW | Will not guess among multiple matches |
 | Idempotency | enforced | `SUCCESS` commands never run twice |
@@ -130,7 +144,17 @@ Typical conversation flow:
 
 See `docs/chatgpt-workflow.md` for prompt patterns and column mapping.
 
+Safe onboarding sequence:
+
+1. Install each account and run `setupSystem()`.
+2. Let sync populate **Messages** (or enqueue `SYNC_NOW`).
+3. Issue test commands while `DRY_RUN=TRUE`.
+4. Inspect **Audit_Log**.
+5. Explicitly set `DRY_RUN=FALSE` in Settings before live mutations.
+
 You should **not** need to manually edit the Sheet during normal use after setup.
+
+If you already ran `setupSystem()` when `DRY_RUN` defaulted to FALSE, set Settings `DRY_RUN` to TRUE until you have inspected Audit_Log and are ready for live mutations.
 
 ---
 
@@ -164,6 +188,8 @@ Sample CSV rows: `samples/sample_commands.csv`.
 - [ ] Inbox messages appear in **Messages** with correct `account_id` after sync  
 - [ ] Re-sync updates rows; no duplicates for same `account_id` + `gmail_message_id`  
 - [ ] `FETCH_FULL_TEXT` fills only the requested message’s `body_text`  
+- [ ] Stored full text expires (or is cleared) without relying on ChatGPT to remember `CLEAR_FULL_TEXT`  
+- [ ] `LABEL`/`ARCHIVE` results state they are thread-level  
 - [ ] No OpenAI API key anywhere in the project  
 
 ---
