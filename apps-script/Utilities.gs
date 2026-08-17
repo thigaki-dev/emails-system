@@ -10,6 +10,21 @@ function nowIso_() {
   return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ssXXX");
 }
 
+function hoursFromNowIso_(hours) {
+  var ms = (Number(hours) || 0) * 60 * 60 * 1000;
+  var d = new Date(Date.now() + ms);
+  return d.toISOString();
+}
+
+/**
+ * Number of data rows below a header in row 1.
+ * SpreadsheetApp.getRange(row, column, numRows, numColumns) takes a row *count*,
+ * not an end index — so callers must use lastRow - 1 when starting at row 2.
+ */
+function dataRowCount_(lastRow) {
+  return lastRow < 2 ? 0 : lastRow - 1;
+}
+
 /**
  * Acquire a document lock for command processing / sync.
  * Returns the lock if acquired, or null if unavailable.

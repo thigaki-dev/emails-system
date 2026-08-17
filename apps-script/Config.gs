@@ -44,9 +44,11 @@ var CONFIG = {
   MAX_MESSAGES_PER_SYNC: 200,
   BODY_SYNC_POLICY: 'SNIPPET_ONLY', // NONE | SNIPPET_ONLY | FULL_TEXT
   MESSAGE_RETENTION_DAYS: 60,
+  FULL_TEXT_TTL_HOURS: 24,
+  MAX_RECONCILE_PER_SYNC: 200,
 
-  // Safety
-  DRY_RUN: false,
+  // Safety — DRY_RUN stays on until you inspect Audit_Log and opt into live mutations
+  DRY_RUN: true,
   TRASH_ENABLED: false,
   AUTO_CREATE_LABELS: true,
 
@@ -85,6 +87,23 @@ var CONFIG = {
     UPDATED: 'UPDATED',
     REMOVED: 'REMOVED',
     ERROR: 'ERROR'
+  },
+
+  /**
+   * Mutation scope contract (GmailApp semantics):
+   *   message — only the targeted GmailMessage is changed
+   *   thread  — the entire thread is changed (GmailApp labels/archive/inbox are thread APIs)
+   */
+  ACTION_SCOPE: {
+    MARK_READ: 'message',
+    MARK_UNREAD: 'message',
+    STAR: 'message',
+    UNSTAR: 'message',
+    TRASH: 'message',
+    LABEL: 'thread',
+    REMOVE_LABEL: 'thread',
+    ARCHIVE: 'thread',
+    MOVE_TO_INBOX: 'thread'
   }
 };
 
@@ -104,6 +123,8 @@ function getRuntimeConfig_() {
     MAX_MESSAGES_PER_SYNC: CONFIG.MAX_MESSAGES_PER_SYNC,
     BODY_SYNC_POLICY: CONFIG.BODY_SYNC_POLICY,
     MESSAGE_RETENTION_DAYS: CONFIG.MESSAGE_RETENTION_DAYS,
+    FULL_TEXT_TTL_HOURS: CONFIG.FULL_TEXT_TTL_HOURS,
+    MAX_RECONCILE_PER_SYNC: CONFIG.MAX_RECONCILE_PER_SYNC,
     DRY_RUN: CONFIG.DRY_RUN,
     TRASH_ENABLED: CONFIG.TRASH_ENABLED,
     AUTO_CREATE_LABELS: CONFIG.AUTO_CREATE_LABELS
@@ -130,7 +151,9 @@ function getRuntimeConfig_() {
         key === 'SYNC_LOOKBACK_DAYS' ||
         key === 'SYNC_POLL_MINUTES' ||
         key === 'MAX_MESSAGES_PER_SYNC' ||
-        key === 'MESSAGE_RETENTION_DAYS'
+        key === 'MESSAGE_RETENTION_DAYS' ||
+        key === 'FULL_TEXT_TTL_HOURS' ||
+        key === 'MAX_RECONCILE_PER_SYNC'
       ) {
         var num = Number(raw);
         if (!isNaN(num) && num > 0) {

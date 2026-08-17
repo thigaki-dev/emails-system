@@ -124,10 +124,21 @@ function processOneCommand_(item, runtime) {
 
       result = executeMutation_(action, resolved.messages, command, runtime);
 
-      // After successful mutation, lightly refresh message metadata when we have IDs
       try {
-        if (!runtime.DRY_RUN && resolved.messages && resolved.messages.length === 1) {
-          upsertMessageRow_(resolved.messages[0], runtime, 'NONE');
+        if (!runtime.DRY_RUN && resolved.messages && resolved.messages.length) {
+          var ssPost = openControlSpreadsheet_();
+          var postIndex = loadMessageIndex_(ensureMessagesSheet_(ssPost));
+          var toRefresh = resolved.messages;
+          if (isThreadLevelAction_(action)) {
+            var th = resolved.messages[0].getThread();
+            if (th) {
+              toRefresh = th.getMessages();
+            }
+          }
+          for (var r = 0; r < toRefresh.length; r++) {
+            upsertMessageRow_(toRefresh[r], runtime, 'NONE', postIndex);
+          }
+          flushMessageIndex_(postIndex);
         }
       } catch (syncErr) {
         Logger.log('post-mutation sync warning: ' + syncErr);
@@ -215,7 +226,7 @@ function runDryRunTest() {
     Logger.log('runDryRunTest result: ' + result);
     return result;
   } finally {
-    setSettingValue_(settings, 'DRY_RUN', previous === '' || previous == null ? 'FALSE' : previous);
+    setSettingValue_(settings, 'DRY_RUN', previous === '' || previous == null ? 'TRUE' : previous);
   }
 }
 

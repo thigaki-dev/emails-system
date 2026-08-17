@@ -45,7 +45,8 @@ function claimPendingCommands_(accountId, maxCount) {
   }
 
   var headerMap = headerIndexMap_(sheet);
-  var range = sheet.getRange(2, 1, lastRow, COMMAND_HEADERS.length);
+  var numRows = dataRowCount_(lastRow);
+  var range = sheet.getRange(2, 1, numRows, COMMAND_HEADERS.length);
   var values = range.getValues();
   var claimed = [];
   var now = new Date().getTime();
