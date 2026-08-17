@@ -60,7 +60,7 @@ assert(readme.includes('Replace TYPE_EMAIL_1_HERE, TYPE_EMAIL_2_HERE'), 'README 
 
 // Safety defaults
 assert(/TRASH_ENABLED:\s*false/i.test(allGs) || /TRASH_ENABLED',\s*'FALSE'/.test(allGs), 'TRASH_ENABLED defaults false');
-assert(/DRY_RUN:\s*false/i.test(allGs) || /DRY_RUN',\s*'FALSE'/.test(allGs), 'DRY_RUN defaults false');
+assert(/DRY_RUN:\s*true/i.test(allGs) || /DRY_RUN',\s*'TRUE'/.test(allGs), 'DRY_RUN defaults true');
 assert(allGs.includes('NEEDS_REVIEW'), 'NEEDS_REVIEW status supported');
 assert(allGs.includes('LockService'), 'uses LockService');
 assert(allGs.includes('writeAuditLog_'), 'audit logging present');
@@ -125,6 +125,7 @@ const messageCols = [
   'subject',
   'snippet',
   'body_text',
+  'body_text_expires_at',
   'labels',
   'is_unread',
   'is_starred',
@@ -205,6 +206,48 @@ assert(
   simulateSyncId('personal', 'm1') !== simulateSyncId('school', 'm1'),
   'acceptance: same message id in two accounts stays distinct'
 );
+
+// Range API: numRows is lastRow-1 from row 2; numColumns is 1 not the column index
+assert(
+  /getRange\(\s*2\s*,\s*col\s*,\s*(?:numRows|lastRow\s*-\s*1)\s*,\s*1\s*\)/.test(allGs),
+  'findMessageRowBySyncId_ uses numRows=lastRow-1 and numColumns=1'
+);
+assert(!/getRange\(\s*2\s*,\s*col\s*,\s*lastRow\s*,\s*col\s*\)/.test(allGs), 'no getRange(2, col, lastRow, col) anti-pattern');
+
+// Action scope contract
+assert(/ACTION_SCOPE/.test(allGs), 'ACTION_SCOPE map defined');
+assert(/function\s+actionScope_/.test(allGs), 'actionScope_ helper defined');
+assert(/thread-level/.test(allGs), 'thread-level language in executor results');
+assert(/message-level/.test(allGs), 'message-level language in executor results');
+
+// Full-text TTL
+assert(allGs.includes('FULL_TEXT_TTL_HOURS'), 'FULL_TEXT_TTL_HOURS setting present');
+assert(allGs.includes('body_text_expires_at'), 'body_text_expires_at column present');
+assert(/function\s+expireFullTextInIndex_/.test(allGs), 'automatic full-text expiry implemented');
+assert(/function\s+shouldPreserveFullText_/.test(allGs), 'full-text retention helper present');
+
+function simulateFullTextPreserve(body, expiresAt, nowMs) {
+  if (!body) return false;
+  if (!expiresAt) return false;
+  const when = new Date(expiresAt).getTime();
+  if (Number.isNaN(when)) return false;
+  return when > nowMs;
+}
+assert(simulateFullTextPreserve('secret', '', Date.now()) === false, 'legacy full text without expiry is not preserved');
+assert(simulateFullTextPreserve('secret', new Date(Date.now() + 3600000).toISOString(), Date.now()) === true, 'unexpired full text is preserved');
+assert(simulateFullTextPreserve('secret', new Date(Date.now() - 1000).toISOString(), Date.now()) === false, 'expired full text is cleared');
+
+// Reconciliation on scheduled sync path
+assert(/reconcileUnseenRows_/.test(allGs), 'unseen-row reconciliation helper present');
+assert(/runMessageSync_[\s\S]*reconcileUnseenRows_/.test(allGs), 'runMessageSync_ reconciles after upserts');
+
+// In-memory sync_id index
+assert(/function\s+loadMessageIndex_/.test(allGs), 'loadMessageIndex_ builds per-run map');
+assert(/rowBySyncId/.test(allGs), 'sync_id → row map used during sync');
+
+// README contract
+assert(/DRY_RUN.*TRUE/i.test(readme) || /defaults to TRUE/.test(readme), 'README documents DRY_RUN default TRUE');
+assert(/thread-level/.test(readme), 'README documents thread-level actions');
 
 console.log('\n' + (failed === 0 ? 'All checks passed.' : failed + ' check(s) failed.'));
 process.exit(failed === 0 ? 0 : 1);

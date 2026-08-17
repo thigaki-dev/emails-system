@@ -5,6 +5,9 @@
  *
  * Each deployment synchronizes ONLY the Gmail account that authorized it.
  * Defaults minimize data: recent window, SNIPPET_ONLY body policy, no attachments.
+ *
+ * FETCH_FULL_TEXT is temporary: body_text is cleared automatically after
+ * FULL_TEXT_TTL_HOURS (default 24) even if ChatGPT never sends CLEAR_FULL_TEXT.
  */
 
 var MESSAGE_HEADERS = [
@@ -20,6 +23,7 @@ var MESSAGE_HEADERS = [
   'subject',
   'snippet',
   'body_text',
+  'body_text_expires_at',
   'labels',
   'is_unread',
   'is_starred',
@@ -39,32 +43,86 @@ function ensureMessagesSheet_(ss) {
 }
 
 /**
- * Sync the configured recent Gmail window for this account.
+ * Load the Messages tab once and index sync_id → values-array offset.
+ * All upserts in a sync run must reuse this object instead of scanning the Sheet.
  */
-function syncRecentMessages() {
+function loadMessageIndex_(sheet) {
+  var lastRow = sheet.getLastRow();
+  var headerMap = headerIndexMap_(sheet);
+  var numRows = dataRowCount_(lastRow);
+  var values =
+    numRows > 0 ? sheet.getRange(2, 1, numRows, MESSAGE_HEADERS.length).getValues() : [];
+  var rowBySyncId = {};
+  var syncCol = headerMap.sync_id;
+  if (syncCol !== undefined) {
+    for (var i = 0; i < values.length; i++) {
+      var sid = String(values[i][syncCol] || '');
+      if (sid) {
+        rowBySyncId[sid] = i;
+      }
+    }
+  }
+  return {
+    sheet: sheet,
+    headerMap: headerMap,
+    values: values,
+    rowBySyncId: rowBySyncId,
+    dirty: false,
+    pendingAppends: []
+  };
+}
+
+function flushMessageIndex_(index) {
+  if (index.dirty && index.values.length > 0) {
+    index.sheet
+      .getRange(2, 1, index.values.length, MESSAGE_HEADERS.length)
+      .setValues(index.values);
+    index.dirty = false;
+  }
+  if (index.pendingAppends.length > 0) {
+    index.sheet
+      .getRange(
+        index.sheet.getLastRow() + 1,
+        1,
+        index.pendingAppends.length,
+        MESSAGE_HEADERS.length
+      )
+      .setValues(index.pendingAppends);
+    index.pendingAppends = [];
+  }
+}
+
+/**
+ * Sync the configured recent Gmail window for this account.
+ * @param {boolean=} optSkipLock true when the caller already holds the script lock
+ */
+function syncRecentMessages(optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   var query = buildLookbackQuery_(runtime.SYNC_LOOKBACK_DAYS, 'in:anywhere');
-  return runMessageSync_('syncRecentMessages', query, runtime, false);
+  return runMessageSync_('syncRecentMessages', query, runtime, !!optSkipLock);
 }
 
 /**
  * Prefer Inbox / unread / starred / recently modified messages.
+ * @param {boolean=} optSkipLock
  */
-function syncPriorityMessages() {
+function syncPriorityMessages(optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   var query = buildLookbackQuery_(
     runtime.SYNC_LOOKBACK_DAYS,
     'in:inbox OR is:unread OR is:starred'
   );
-  return runMessageSync_('syncPriorityMessages', query, runtime, false);
+  return runMessageSync_('syncPriorityMessages', query, runtime, !!optSkipLock);
 }
 
 /**
  * Refresh one exact Gmail message into the Messages tab.
+ * @param {string} messageId
+ * @param {boolean=} optSkipLock
  */
-function syncOneMessage(messageId) {
+function syncOneMessage(messageId, optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   if (!messageId) {
@@ -74,12 +132,19 @@ function syncOneMessage(messageId) {
   if (!msg) {
     throw new Error('Message not found: ' + messageId);
   }
-  var lock = acquireLock_(30000);
-  if (!lock) {
-    throw new Error('Could not acquire lock for syncOneMessage');
+  var lock = null;
+  if (!optSkipLock) {
+    lock = acquireLock_(30000);
+    if (!lock) {
+      throw new Error('Could not acquire lock for syncOneMessage');
+    }
   }
   try {
-    upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY);
+    var ss = openControlSpreadsheet_();
+    var index = loadMessageIndex_(ensureMessagesSheet_(ss));
+    upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY, index);
+    expireFullTextInIndex_(index, runtime);
+    flushMessageIndex_(index);
     return 'Refreshed message ' + messageId;
   } finally {
     releaseLock_(lock);
@@ -88,8 +153,11 @@ function syncOneMessage(messageId) {
 
 /**
  * Populate body_text for one exact message (ChatGPT-directed escalation).
+ * Sets body_text_expires_at so cleanup is automatic.
+ * @param {string} messageId
+ * @param {boolean=} optSkipLock
  */
-function fetchFullTextForMessage(messageId) {
+function fetchFullTextForMessage(messageId, optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   if (!messageId) {
@@ -99,13 +167,25 @@ function fetchFullTextForMessage(messageId) {
   if (!msg) {
     throw new Error('Message not found: ' + messageId);
   }
-  var lock = acquireLock_(30000);
-  if (!lock) {
-    throw new Error('Could not acquire lock for fetchFullTextForMessage');
+  var lock = null;
+  if (!optSkipLock) {
+    lock = acquireLock_(30000);
+    if (!lock) {
+      throw new Error('Could not acquire lock for fetchFullTextForMessage');
+    }
   }
   try {
-    upsertMessageRow_(msg, runtime, 'FULL_TEXT');
-    return 'Fetched full text for message ' + messageId;
+    var ss = openControlSpreadsheet_();
+    var index = loadMessageIndex_(ensureMessagesSheet_(ss));
+    upsertMessageRow_(msg, runtime, 'FULL_TEXT', index);
+    flushMessageIndex_(index);
+    return (
+      'Fetched full text for message ' +
+      messageId +
+      ' (expires ' +
+      hoursFromNowIso_(runtime.FULL_TEXT_TTL_HOURS || 24) +
+      ')'
+    );
   } finally {
     releaseLock_(lock);
   }
@@ -113,85 +193,80 @@ function fetchFullTextForMessage(messageId) {
 
 /**
  * Remove cached body_text for one message after ChatGPT no longer needs it.
+ * @param {string} messageId
+ * @param {boolean=} optSkipLock
  */
-function clearStoredBodyText(messageId) {
+function clearStoredBodyText(messageId, optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   if (!messageId) {
     throw new Error('clearStoredBodyText requires messageId');
   }
-  var ss = openControlSpreadsheet_();
-  var sheet = ensureMessagesSheet_(ss);
-  var syncId = makeSyncId_(runtime.ACCOUNT_ID, messageId);
-  var found = findMessageRowBySyncId_(sheet, syncId);
-  if (!found) {
-    return 'No Messages row for ' + syncId + '; nothing to clear';
+  var lock = null;
+  if (!optSkipLock) {
+    lock = acquireLock_(30000);
+    if (!lock) {
+      throw new Error('Could not acquire lock for clearStoredBodyText');
+    }
   }
-  var headerMap = headerIndexMap_(sheet);
-  var row = sheet.getRange(found.rowNumber, 1, 1, MESSAGE_HEADERS.length).getValues()[0];
-  row[headerMap.body_text] = '';
-  row[headerMap.last_synced_at] = nowIso_();
-  row[headerMap.sync_state] = CONFIG.SYNC_STATE.UPDATED;
-  sheet.getRange(found.rowNumber, 1, 1, MESSAGE_HEADERS.length).setValues([row]);
-  return 'Cleared body_text for ' + syncId;
+  try {
+    var ss = openControlSpreadsheet_();
+    var sheet = ensureMessagesSheet_(ss);
+    var index = loadMessageIndex_(sheet);
+    var syncId = makeSyncId_(runtime.ACCOUNT_ID, messageId);
+    var offset = index.rowBySyncId[syncId];
+    if (offset === undefined) {
+      return 'No Messages row for ' + syncId + '; nothing to clear';
+    }
+    var headerMap = index.headerMap;
+    index.values[offset][headerMap.body_text] = '';
+    if (headerMap.body_text_expires_at !== undefined) {
+      index.values[offset][headerMap.body_text_expires_at] = '';
+    }
+    index.values[offset][headerMap.last_synced_at] = nowIso_();
+    index.values[offset][headerMap.sync_state] = CONFIG.SYNC_STATE.UPDATED;
+    index.dirty = true;
+    flushMessageIndex_(index);
+    return 'Cleared body_text for ' + syncId;
+  } finally {
+    releaseLock_(lock);
+  }
 }
 
 /**
  * Update labels/read/star/archive/trash state for this account's Messages rows
  * that still exist in Gmail. Marks missing messages as REMOVED (does not delete rows).
+ * @param {boolean=} optSkipLock
  */
-function reconcileMessageState() {
+function reconcileMessageState(optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
-  var lock = acquireLock_(30000);
-  if (!lock) {
-    throw new Error('Could not acquire lock for reconcileMessageState');
+  var lock = null;
+  if (!optSkipLock) {
+    lock = acquireLock_(30000);
+    if (!lock) {
+      throw new Error('Could not acquire lock for reconcileMessageState');
+    }
   }
   try {
     var ss = openControlSpreadsheet_();
     var sheet = ensureMessagesSheet_(ss);
-    var lastRow = sheet.getLastRow();
-    if (lastRow < 2) {
+    var index = loadMessageIndex_(sheet);
+    if (index.values.length === 0) {
       return 'No message rows to reconcile';
     }
-    var headerMap = headerIndexMap_(sheet);
-    var values = sheet.getRange(2, 1, lastRow, MESSAGE_HEADERS.length).getValues();
-    var updated = 0;
-    var removed = 0;
-
-    for (var i = 0; i < values.length; i++) {
-      var obj = rowToObject_(values[i], headerMap);
-      if (String(obj.account_id || '').trim() !== runtime.ACCOUNT_ID) {
-        continue;
-      }
-      var mid = String(obj.gmail_message_id || '').trim();
-      if (!mid) {
-        continue;
-      }
-      try {
-        var msg = GmailApp.getMessageById(mid);
-        if (!msg) {
-          values[i][headerMap.sync_state] = CONFIG.SYNC_STATE.REMOVED;
-          values[i][headerMap.last_synced_at] = nowIso_();
-          removed++;
-          continue;
-        }
-        var snapshot = buildMessageSnapshot_(msg, runtime, 'NONE');
-        // Preserve existing body_text unless policy says otherwise
-        snapshot.body_text = obj.body_text || '';
-        snapshot.sync_state = CONFIG.SYNC_STATE.UPDATED;
-        values[i] = objectToRow_(snapshot, MESSAGE_HEADERS);
-        updated++;
-      } catch (err) {
-        values[i][headerMap.sync_state] = CONFIG.SYNC_STATE.REMOVED;
-        values[i][headerMap.last_synced_at] = nowIso_();
-        removed++;
-      }
-    }
-
-    sheet.getRange(2, 1, lastRow, MESSAGE_HEADERS.length).setValues(values);
+    var result = reconcileUnseenRows_(index, {}, runtime, runtime.MAX_RECONCILE_PER_SYNC || 200);
+    expireFullTextInIndex_(index, runtime);
+    flushMessageIndex_(index);
     pruneOldMessageRows_(sheet, runtime);
-    return 'Reconciled: updated=' + updated + ', marked_removed=' + removed;
+    return (
+      'Reconciled: updated=' +
+      result.updated +
+      ', marked_removed=' +
+      result.removed +
+      ', expired_bodies=' +
+      result.expiredBodies
+    );
   } finally {
     releaseLock_(lock);
   }
@@ -199,7 +274,9 @@ function reconcileMessageState() {
 
 /**
  * Internal sync runner used by syncRecentMessages / syncPriorityMessages
- * and the scheduled trigger.
+ * and the scheduled trigger. After upserting matches, reconciles existing
+ * rows that fell out of the query (archived/trashed/moved) so ChatGPT does
+ * not keep seeing stale Inbox state.
  */
 function runMessageSync_(label, query, runtime, skipLock) {
   var lock = null;
@@ -210,6 +287,10 @@ function runMessageSync_(label, query, runtime, skipLock) {
     }
   }
   try {
+    var ss = openControlSpreadsheet_();
+    var sheet = ensureMessagesSheet_(ss);
+    var index = loadMessageIndex_(sheet);
+
     var max = runtime.MAX_MESSAGES_PER_SYNC || 200;
     var threads = GmailApp.search(query, 0, Math.min(max, 500));
     var seenIds = {};
@@ -227,7 +308,7 @@ function runMessageSync_(label, query, runtime, skipLock) {
           continue;
         }
         seenIds[id] = true;
-        upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY);
+        upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY, index);
         upserts++;
       }
       if (upserts >= max) {
@@ -235,15 +316,29 @@ function runMessageSync_(label, query, runtime, skipLock) {
       }
     }
 
-    // Mark previously ACTIVE rows for this account that were not seen as REMOVED
-    // only within the lookback window sync — done lightly via reconcile of unseen
-    // is expensive; instead prune old rows and leave unseen ACTIVE rows until
-    // reconcileMessageState is called.
-    var ss = openControlSpreadsheet_();
-    var sheet = ensureMessagesSheet_(ss);
+    var recon = reconcileUnseenRows_(
+      index,
+      seenIds,
+      runtime,
+      runtime.MAX_RECONCILE_PER_SYNC || 200
+    );
+    var expired = expireFullTextInIndex_(index, runtime);
+    flushMessageIndex_(index);
     pruneOldMessageRows_(sheet, runtime);
 
-    var summary = label + ': upserted ' + upserts + ' messages (query=' + query + ')';
+    var summary =
+      label +
+      ': upserted ' +
+      upserts +
+      ', reconciled_updated=' +
+      recon.updated +
+      ', marked_removed=' +
+      recon.removed +
+      ', expired_bodies=' +
+      expired +
+      ' (query=' +
+      query +
+      ')';
     Logger.log(summary);
     return summary;
   } finally {
@@ -251,33 +346,151 @@ function runMessageSync_(label, query, runtime, skipLock) {
   }
 }
 
-function upsertMessageRow_(msg, runtime, bodyPolicy) {
-  var ss = openControlSpreadsheet_();
-  var sheet = ensureMessagesSheet_(ss);
-  var snapshot = buildMessageSnapshot_(msg, runtime, bodyPolicy);
-  var found = findMessageRowBySyncId_(sheet, snapshot.sync_id);
-
-  if (found) {
-    // Preserve FULL_TEXT body unless this call explicitly refreshes or clears
-    if (bodyPolicy !== 'FULL_TEXT') {
-      var headerMap = headerIndexMap_(sheet);
-      var existing = sheet.getRange(found.rowNumber, 1, 1, MESSAGE_HEADERS.length).getValues()[0];
-      var existingBody = existing[headerMap.body_text];
-      if (bodyPolicy === 'NONE' || bodyPolicy === 'SNIPPET_ONLY') {
-        // Keep previously fetched full text unless clearing explicitly
-        if (existingBody) {
-          snapshot.body_text = existingBody;
-        }
-      }
-    }
-    snapshot.sync_state = CONFIG.SYNC_STATE.UPDATED;
-    sheet
-      .getRange(found.rowNumber, 1, 1, MESSAGE_HEADERS.length)
-      .setValues([objectToRow_(snapshot, MESSAGE_HEADERS)]);
-  } else {
-    snapshot.sync_state = CONFIG.SYNC_STATE.ACTIVE;
-    sheet.appendRow(objectToRow_(snapshot, MESSAGE_HEADERS));
+function upsertMessageRow_(msg, runtime, bodyPolicy, index) {
+  var ownsIndex = !index;
+  if (!index) {
+    var ss = openControlSpreadsheet_();
+    index = loadMessageIndex_(ensureMessagesSheet_(ss));
   }
+  var snapshot = buildMessageSnapshot_(msg, runtime, bodyPolicy);
+  var offset = index.rowBySyncId[snapshot.sync_id];
+  index._pendingBySyncId = index._pendingBySyncId || {};
+
+  if (offset !== undefined) {
+    var existing = rowToObject_(index.values[offset], index.headerMap);
+    applyBodyRetention_(snapshot, existing, bodyPolicy, runtime);
+    snapshot.sync_state = CONFIG.SYNC_STATE.UPDATED;
+    index.values[offset] = objectToRow_(snapshot, MESSAGE_HEADERS);
+    index.dirty = true;
+  } else {
+    var pendingIdx = index._pendingBySyncId[snapshot.sync_id];
+    if (pendingIdx !== undefined) {
+      var existingPending = rowToObject_(index.pendingAppends[pendingIdx], index.headerMap);
+      applyBodyRetention_(snapshot, existingPending, bodyPolicy, runtime);
+      snapshot.sync_state = CONFIG.SYNC_STATE.ACTIVE;
+      index.pendingAppends[pendingIdx] = objectToRow_(snapshot, MESSAGE_HEADERS);
+    } else {
+      snapshot.sync_state = CONFIG.SYNC_STATE.ACTIVE;
+      index._pendingBySyncId[snapshot.sync_id] = index.pendingAppends.length;
+      index.pendingAppends.push(objectToRow_(snapshot, MESSAGE_HEADERS));
+    }
+  }
+
+  if (ownsIndex) {
+    flushMessageIndex_(index);
+  }
+}
+
+/**
+ * Keep FETCH_FULL_TEXT bodies only while body_text_expires_at is in the future.
+ * Legacy rows with body_text but no expiry are cleared on the next sync.
+ */
+function applyBodyRetention_(snapshot, existing, bodyPolicy, runtime) {
+  var policy = String(bodyPolicy || '').toUpperCase();
+  if (policy === 'FULL_TEXT') {
+    snapshot.body_text_expires_at = hoursFromNowIso_(runtime.FULL_TEXT_TTL_HOURS || 24);
+    return;
+  }
+  if (shouldPreserveFullText_(existing.body_text, existing.body_text_expires_at)) {
+    snapshot.body_text = existing.body_text;
+    snapshot.body_text_expires_at = existing.body_text_expires_at;
+  } else {
+    snapshot.body_text = '';
+    snapshot.body_text_expires_at = '';
+  }
+}
+
+function shouldPreserveFullText_(body, expiresAt) {
+  if (!body) {
+    return false;
+  }
+  if (!expiresAt) {
+    return false;
+  }
+  var when = new Date(expiresAt).getTime();
+  if (isNaN(when)) {
+    return false;
+  }
+  return when > Date.now();
+}
+
+function expireFullTextInIndex_(index, runtime) {
+  var headerMap = index.headerMap;
+  if (headerMap.body_text === undefined) {
+    return 0;
+  }
+  var cleared = 0;
+  for (var i = 0; i < index.values.length; i++) {
+    var obj = rowToObject_(index.values[i], headerMap);
+    if (String(obj.account_id || '').trim() !== runtime.ACCOUNT_ID) {
+      continue;
+    }
+    if (!obj.body_text) {
+      continue;
+    }
+    var expired = !shouldPreserveFullText_(obj.body_text, obj.body_text_expires_at);
+    if (expired) {
+      index.values[i][headerMap.body_text] = '';
+      if (headerMap.body_text_expires_at !== undefined) {
+        index.values[i][headerMap.body_text_expires_at] = '';
+      }
+      index.values[i][headerMap.last_synced_at] = nowIso_();
+      index.dirty = true;
+      cleared++;
+    }
+  }
+  return cleared;
+}
+
+/**
+ * Refresh this account's existing Messages rows that were not just upserted.
+ * Updates archive/inbox/label/read state; marks gone mail as REMOVED.
+ */
+function reconcileUnseenRows_(index, seenIds, runtime, cap) {
+  var headerMap = index.headerMap;
+  var updated = 0;
+  var removed = 0;
+  var lookups = 0;
+  var skipped = 0;
+
+  for (var i = 0; i < index.values.length; i++) {
+    var obj = rowToObject_(index.values[i], headerMap);
+    if (String(obj.account_id || '').trim() !== runtime.ACCOUNT_ID) {
+      continue;
+    }
+    var mid = String(obj.gmail_message_id || '').trim();
+    if (!mid || seenIds[mid]) {
+      continue;
+    }
+    if (lookups >= cap) {
+      skipped++;
+      continue;
+    }
+    lookups++;
+    try {
+      var msg = GmailApp.getMessageById(mid);
+      if (!msg) {
+        index.values[i][headerMap.sync_state] = CONFIG.SYNC_STATE.REMOVED;
+        index.values[i][headerMap.last_synced_at] = nowIso_();
+        index.dirty = true;
+        removed++;
+        continue;
+      }
+      var snapshot = buildMessageSnapshot_(msg, runtime, 'NONE');
+      applyBodyRetention_(snapshot, obj, 'NONE', runtime);
+      snapshot.sync_state = CONFIG.SYNC_STATE.UPDATED;
+      index.values[i] = objectToRow_(snapshot, MESSAGE_HEADERS);
+      index.dirty = true;
+      updated++;
+    } catch (err) {
+      index.values[i][headerMap.sync_state] = CONFIG.SYNC_STATE.REMOVED;
+      index.values[i][headerMap.last_synced_at] = nowIso_();
+      index.dirty = true;
+      removed++;
+    }
+  }
+
+  return { updated: updated, removed: removed, skipped: skipped, expiredBodies: 0 };
 }
 
 function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
@@ -293,7 +506,6 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
     labels = userLabels.map(function (l) {
       return l.getName();
     });
-    // Synthetic system-state tags (GmailApp user labels omit Inbox/Archive/Trash)
     try {
       if (thread.isInInbox()) {
         labels.push('INBOX');
@@ -311,12 +523,15 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
   }
 
   var bodyText = '';
+  var expiresAt = '';
   var policy = (bodyPolicy || runtime.BODY_SYNC_POLICY || 'SNIPPET_ONLY').toUpperCase();
   if (policy === 'FULL_TEXT') {
     try {
       bodyText = truncate_(msg.getPlainBody() || '', 50000);
+      expiresAt = hoursFromNowIso_(runtime.FULL_TEXT_TTL_HOURS || 24);
     } catch (err) {
       bodyText = '';
+      expiresAt = '';
     }
   }
 
@@ -342,6 +557,7 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
     subject: msg.getSubject() || '',
     snippet: snippet,
     body_text: bodyText,
+    body_text_expires_at: expiresAt,
     labels: normalizeLabelList_(labels),
     is_unread: boolToSheet_(msg.isUnread()),
     is_starred: boolToSheet_(msg.isStarred()),
@@ -352,14 +568,23 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
   };
 }
 
+/**
+ * Single-row lookup. Prefer loadMessageIndex_ during bulk sync.
+ * getRange(row, column, numRows, numColumns) — numRows is lastRow - 1 when
+ * starting at row 2; numColumns is 1, not the column index.
+ */
 function findMessageRowBySyncId_(sheet, syncId) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
     return null;
   }
   var headerMap = headerIndexMap_(sheet);
+  if (headerMap.sync_id === undefined) {
+    return null;
+  }
   var col = headerMap.sync_id + 1;
-  var values = sheet.getRange(2, col, lastRow, col).getValues();
+  var numRows = lastRow - 1;
+  var values = sheet.getRange(2, col, numRows, 1).getValues();
   for (var i = 0; i < values.length; i++) {
     if (String(values[i][0]) === syncId) {
       return { rowNumber: i + 2 };
@@ -379,12 +604,12 @@ function pruneOldMessageRows_(sheet, runtime) {
   }
   var cutoff = new Date().getTime() - retentionDays * 24 * 60 * 60 * 1000;
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
+  var numRows = dataRowCount_(lastRow);
+  if (numRows < 1) {
     return;
   }
   var headerMap = headerIndexMap_(sheet);
-  var values = sheet.getRange(2, 1, lastRow, MESSAGE_HEADERS.length).getValues();
-  // Delete from bottom to top
+  var values = sheet.getRange(2, 1, numRows, MESSAGE_HEADERS.length).getValues();
   for (var i = values.length - 1; i >= 0; i--) {
     var obj = rowToObject_(values[i], headerMap);
     if (String(obj.account_id || '').trim() !== runtime.ACCOUNT_ID) {

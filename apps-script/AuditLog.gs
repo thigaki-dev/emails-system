@@ -16,6 +16,7 @@ var AUDIT_HEADERS = [
   'gmail_thread_id',
   'label_name',
   'dry_run',
+  'scope',
   'outcome',
   'detail',
   'error'
@@ -47,6 +48,7 @@ function writeAuditLog_(entry) {
     gmail_thread_id: entry.gmail_thread_id || '',
     label_name: entry.label_name || '',
     dry_run: boolToSheet_(!!entry.dry_run),
+    scope: entry.scope || '',
     outcome: entry.outcome || '',
     detail: truncate_(entry.detail || '', 2000),
     error: truncate_(entry.error || '', 2000)
