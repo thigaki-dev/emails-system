@@ -41,6 +41,7 @@ function processPendingCommands() {
 /**
  * Process a single claimed command. Failures are isolated — one bad command
  * does not block the rest of this run, and other accounts have their own deployments.
+ * Transient Gmail quota/rate-limit errors become RETRY_LATER (not FAILED) with backoff.
  */
 function processOneCommand_(item, runtime) {
   var command = item.data;
@@ -108,6 +109,9 @@ function processOneCommand_(item, runtime) {
           });
           return commandId + ': NEEDS_REVIEW';
         }
+        if (isRetryableGmailError_(resolved.error)) {
+          return deferCommandForRetry_(rowNumber, command, runtime, resolved.error);
+        }
         markCommandFailed_(rowNumber, resolved.error);
         writeAuditLog_({
           account_id: runtime.ACCOUNT_ID,
@@ -124,6 +128,7 @@ function processOneCommand_(item, runtime) {
 
       result = executeMutation_(action, resolved.messages, command, runtime);
 
+      // Targeted post-mutation refresh only — never mailbox-wide reconciliation here.
       try {
         if (!runtime.DRY_RUN && resolved.messages && resolved.messages.length) {
           var ssPost = openControlSpreadsheet_();
@@ -141,7 +146,11 @@ function processOneCommand_(item, runtime) {
           flushMessageIndex_(postIndex);
         }
       } catch (syncErr) {
-        Logger.log('post-mutation sync warning: ' + syncErr);
+        if (isRetryableGmailError_(syncErr)) {
+          Logger.log('post-mutation sync quota warning (command already applied): ' + syncErr);
+        } else {
+          Logger.log('post-mutation sync warning: ' + syncErr);
+        }
       }
     }
 
@@ -149,6 +158,9 @@ function processOneCommand_(item, runtime) {
     return commandId + ': SUCCESS';
   } catch (err) {
     var errText = String(err);
+    if (isRetryableGmailError_(err)) {
+      return deferCommandForRetry_(rowNumber, command, runtime, errText);
+    }
     markCommandFailed_(rowNumber, errText);
     writeAuditLog_({
       account_id: runtime.ACCOUNT_ID,
@@ -166,7 +178,29 @@ function processOneCommand_(item, runtime) {
 }
 
 /**
- * Scheduled message synchronization entry point (default every 10–15 minutes).
+ * Mark RETRY_LATER with backoff and write Audit_Log. Does not hammer Gmail every 5 minutes.
+ */
+function deferCommandForRetry_(rowNumber, command, runtime, errText) {
+  var prev = Number(command.retry_count) || 0;
+  var defer = markCommandRetryLater_(rowNumber, errText, prev, runtime);
+  writeAuditLog_({
+    account_id: runtime.ACCOUNT_ID,
+    account_email: runtime.ACCOUNT_EMAIL,
+    command_id: command.command_id,
+    action: command.action,
+    gmail_message_id: command.gmail_message_id,
+    label_name: command.label_name,
+    outcome: 'RETRY_LATER',
+    error: errText,
+    detail: 'retry_count=' + defer.retry_count + '; next_retry_at=' + defer.next_retry_at,
+    dry_run: runtime.DRY_RUN
+  });
+  return command.command_id + ': RETRY_LATER (retry_count=' + defer.retry_count + ')';
+}
+
+/**
+ * Scheduled steady-state message synchronization (default every 30 minutes).
+ * Bounded priority/incremental upsert only — no broad reconciliation.
  */
 function scheduledMessageSync() {
   assertDeploymentIdentityConfigured_();
@@ -177,13 +211,35 @@ function scheduledMessageSync() {
     return 'skipped: lock';
   }
   try {
-    var priority = runMessageSync_(
+    var query = buildSteadyStateSyncQuery_(runtime);
+    return runMessageSync_(
       'scheduledPriority',
-      buildLookbackQuery_(runtime.SYNC_LOOKBACK_DAYS, 'in:inbox OR is:unread OR is:starred'),
+      query,
       runtime,
+      true,
+      runtime.MAX_MESSAGES_PER_SYNC,
       true
     );
-    return priority;
+  } finally {
+    releaseLock_(lock);
+  }
+}
+
+/**
+ * Low-frequency background reconciliation (default every 6 hours).
+ * Detects messages archived/trashed/moved directly in Gmail.
+ * Bounded by MAX_RECONCILE_PER_SYNC with a progressing cursor.
+ */
+function scheduledMessageReconciliation() {
+  assertDeploymentIdentityConfigured_();
+  var runtime = getRuntimeConfig_();
+  var lock = acquireLock_(30000);
+  if (!lock) {
+    Logger.log('scheduledMessageReconciliation: lock unavailable');
+    return 'skipped: lock';
+  }
+  try {
+    return reconcileMessageState(true);
   } finally {
     releaseLock_(lock);
   }

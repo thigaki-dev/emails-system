@@ -25,6 +25,10 @@ var CONTROL_SHEET_ID = 'TYPE_SHARED_GOOGLE_SHEET_ID_HERE'; // Spreadsheet ID fro
 /**
  * Safe defaults. Prefer changing values via the Settings sheet after setup
  * rather than hard-coding here, except for the three identity fields above.
+ *
+ * Quota posture: scheduled sync is intentionally conservative. Use
+ * runInitialSync() for one-time backfill; do not lower SYNC_POLL_MINUTES or
+ * raise caps casually — Gmail Apps Script daily quotas are easy to exhaust.
  */
 var CONFIG = {
   // Sheet tab names
@@ -38,14 +42,21 @@ var CONFIG = {
   MAX_COMMANDS_PER_RUN: 25,
   COMMAND_POLL_MINUTES: 5,
 
-  // Message sync
+  // Message sync (steady-state defaults — keep modest to protect Gmail quotas)
   SYNC_LOOKBACK_DAYS: 30,
-  SYNC_POLL_MINUTES: 15,
-  MAX_MESSAGES_PER_SYNC: 200,
+  SYNC_POLL_MINUTES: 30,
+  MAX_MESSAGES_PER_SYNC: 75,
+  INITIAL_MAX_MESSAGES_PER_SYNC: 200,
   BODY_SYNC_POLICY: 'SNIPPET_ONLY', // NONE | SNIPPET_ONLY | FULL_TEXT
   MESSAGE_RETENTION_DAYS: 60,
   FULL_TEXT_TTL_HOURS: 24,
-  MAX_RECONCILE_PER_SYNC: 200,
+  MAX_RECONCILE_PER_SYNC: 25,
+  RECONCILE_INTERVAL_HOURS: 6,
+
+  // Retry / backoff for transient Gmail quota errors (RETRY_LATER)
+  RETRY_BACKOFF_MINUTES_1: 30,
+  RETRY_BACKOFF_MINUTES_2: 120,
+  RETRY_BACKOFF_MINUTES_3: 360,
 
   // Safety — DRY_RUN stays on until you inspect Audit_Log and opt into live mutations
   DRY_RUN: true,
@@ -58,7 +69,8 @@ var CONFIG = {
     PROCESSING: 'PROCESSING',
     SUCCESS: 'SUCCESS',
     FAILED: 'FAILED',
-    NEEDS_REVIEW: 'NEEDS_REVIEW'
+    NEEDS_REVIEW: 'NEEDS_REVIEW',
+    RETRY_LATER: 'RETRY_LATER'
   },
 
   // Mutation actions (Phase 1 + Phase 2)
@@ -121,10 +133,15 @@ function getRuntimeConfig_() {
     SYNC_LOOKBACK_DAYS: CONFIG.SYNC_LOOKBACK_DAYS,
     SYNC_POLL_MINUTES: CONFIG.SYNC_POLL_MINUTES,
     MAX_MESSAGES_PER_SYNC: CONFIG.MAX_MESSAGES_PER_SYNC,
+    INITIAL_MAX_MESSAGES_PER_SYNC: CONFIG.INITIAL_MAX_MESSAGES_PER_SYNC,
     BODY_SYNC_POLICY: CONFIG.BODY_SYNC_POLICY,
     MESSAGE_RETENTION_DAYS: CONFIG.MESSAGE_RETENTION_DAYS,
     FULL_TEXT_TTL_HOURS: CONFIG.FULL_TEXT_TTL_HOURS,
     MAX_RECONCILE_PER_SYNC: CONFIG.MAX_RECONCILE_PER_SYNC,
+    RECONCILE_INTERVAL_HOURS: CONFIG.RECONCILE_INTERVAL_HOURS,
+    RETRY_BACKOFF_MINUTES_1: CONFIG.RETRY_BACKOFF_MINUTES_1,
+    RETRY_BACKOFF_MINUTES_2: CONFIG.RETRY_BACKOFF_MINUTES_2,
+    RETRY_BACKOFF_MINUTES_3: CONFIG.RETRY_BACKOFF_MINUTES_3,
     DRY_RUN: CONFIG.DRY_RUN,
     TRASH_ENABLED: CONFIG.TRASH_ENABLED,
     AUTO_CREATE_LABELS: CONFIG.AUTO_CREATE_LABELS
@@ -151,9 +168,14 @@ function getRuntimeConfig_() {
         key === 'SYNC_LOOKBACK_DAYS' ||
         key === 'SYNC_POLL_MINUTES' ||
         key === 'MAX_MESSAGES_PER_SYNC' ||
+        key === 'INITIAL_MAX_MESSAGES_PER_SYNC' ||
         key === 'MESSAGE_RETENTION_DAYS' ||
         key === 'FULL_TEXT_TTL_HOURS' ||
-        key === 'MAX_RECONCILE_PER_SYNC'
+        key === 'MAX_RECONCILE_PER_SYNC' ||
+        key === 'RECONCILE_INTERVAL_HOURS' ||
+        key === 'RETRY_BACKOFF_MINUTES_1' ||
+        key === 'RETRY_BACKOFF_MINUTES_2' ||
+        key === 'RETRY_BACKOFF_MINUTES_3'
       ) {
         var num = Number(raw);
         if (!isNaN(num) && num > 0) {

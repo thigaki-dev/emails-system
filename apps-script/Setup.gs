@@ -12,13 +12,18 @@ var DEFAULT_SETTINGS_ROWS = [
   ['AUTO_CREATE_LABELS', 'TRUE', 'Create missing user labels on LABEL actions (thread-level).'],
   ['MAX_COMMANDS_PER_RUN', '25', 'Cap on commands processed per processPendingCommands run.'],
   ['COMMAND_POLL_MINUTES', '5', 'Minutes between command-processor triggers.'],
-  ['SYNC_LOOKBACK_DAYS', '30', 'How far back message sync looks by default.'],
-  ['SYNC_POLL_MINUTES', '15', 'Minutes between message-sync triggers.'],
-  ['MAX_MESSAGES_PER_SYNC', '200', 'Cap on messages upserted per sync run.'],
-  ['MAX_RECONCILE_PER_SYNC', '200', 'Cap on existing Messages rows refreshed for archive/delete state per sync.'],
-  ['BODY_SYNC_POLICY', 'SNIPPET_ONLY', 'NONE | SNIPPET_ONLY | FULL_TEXT'],
+  ['SYNC_LOOKBACK_DAYS', '30', 'How far back initial/backfill sync looks by default.'],
+  ['SYNC_POLL_MINUTES', '30', 'Minutes between steady-state message-sync triggers (quota-safe default).'],
+  ['MAX_MESSAGES_PER_SYNC', '75', 'Cap on messages upserted per scheduled/steady-state sync run.'],
+  ['INITIAL_MAX_MESSAGES_PER_SYNC', '200', 'Cap on messages upserted during runInitialSync backfill only.'],
+  ['MAX_RECONCILE_PER_SYNC', '25', 'Cap on existing Messages rows refreshed per low-frequency reconciliation run.'],
+  ['RECONCILE_INTERVAL_HOURS', '6', 'Hours between scheduledMessageReconciliation runs (Apps Script: 1/2/4/6/8/12).'],
+  ['BODY_SYNC_POLICY', 'SNIPPET_ONLY', 'NONE | SNIPPET_ONLY | FULL_TEXT. SNIPPET_ONLY avoids full-body Gmail reads.'],
   ['FULL_TEXT_TTL_HOURS', '24', 'Automatically clear Messages.body_text this many hours after FETCH_FULL_TEXT.'],
-  ['MESSAGE_RETENTION_DAYS', '60', 'Prune Messages rows older than this many days.']
+  ['MESSAGE_RETENTION_DAYS', '60', 'Prune Messages rows older than this many days.'],
+  ['RETRY_BACKOFF_MINUTES_1', '30', 'Backoff before first RETRY_LATER reclaim after a Gmail quota/rate-limit error.'],
+  ['RETRY_BACKOFF_MINUTES_2', '120', 'Backoff before second RETRY_LATER reclaim.'],
+  ['RETRY_BACKOFF_MINUTES_3', '360', 'Backoff for third and subsequent RETRY_LATER reclaims.']
 ];
 
 var DEFAULT_ACCOUNTS = [
@@ -30,6 +35,8 @@ var DEFAULT_ACCOUNTS = [
 /**
  * Primary setup entry point. Run once per deployment after editing Config.gs.
  * Creates/repairs all control-sheet tabs and installs triggers (without duplicates).
+ * Safe to re-run on existing deployments: merges missing Settings/columns without
+ * overwriting user setting values or destroying Accounts/Messages/Commands/Audit_Log data.
  */
 function setupSystem() {
   assertDeploymentIdentityConfigured_();
@@ -92,13 +99,14 @@ function ensureSettingsSheet_(ss) {
 }
 
 /**
- * Install time-driven triggers for command processing and message sync.
- * Removes duplicates for the same handler before creating new ones.
+ * Install time-driven triggers for command processing, message sync, and
+ * low-frequency reconciliation. Removes duplicates for the same handler first.
  */
 function installTriggers_() {
   var runtime = getRuntimeConfig_();
   removeTriggersForHandler_('processPendingCommands');
   removeTriggersForHandler_('scheduledMessageSync');
+  removeTriggersForHandler_('scheduledMessageReconciliation');
 
   ScriptApp.newTrigger('processPendingCommands')
     .timeBased()
@@ -107,7 +115,12 @@ function installTriggers_() {
 
   ScriptApp.newTrigger('scheduledMessageSync')
     .timeBased()
-    .everyMinutes(normalizePollMinutes_(runtime.SYNC_POLL_MINUTES, 15))
+    .everyMinutes(normalizePollMinutes_(runtime.SYNC_POLL_MINUTES, 30))
+    .create();
+
+  ScriptApp.newTrigger('scheduledMessageReconciliation')
+    .timeBased()
+    .everyHours(normalizeReconcileHours_(runtime.RECONCILE_INTERVAL_HOURS, 6))
     .create();
 
   Logger.log(
@@ -115,12 +128,16 @@ function installTriggers_() {
       runtime.COMMAND_POLL_MINUTES +
       'm; scheduledMessageSync every ' +
       runtime.SYNC_POLL_MINUTES +
-      'm'
+      'm; scheduledMessageReconciliation every ' +
+      runtime.RECONCILE_INTERVAL_HOURS +
+      'h'
   );
 }
 
 /**
  * Recreate triggers using current Settings values.
+ * Removes obsolete/duplicate handlers (including pre-quota-efficiency schedules)
+ * and installs the quota-efficient set.
  */
 function recreateTriggers() {
   assertDeploymentIdentityConfigured_();
@@ -158,6 +175,27 @@ function normalizePollMinutes_(value, fallback) {
     return n;
   }
   // Pick nearest allowed
+  var best = fallback;
+  var bestDiff = 999;
+  for (var i = 0; i < allowed.length; i++) {
+    var diff = Math.abs(allowed[i] - n);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = allowed[i];
+    }
+  }
+  return best;
+}
+
+/**
+ * Apps Script everyHours supports 1, 2, 4, 6, 8, 12.
+ */
+function normalizeReconcileHours_(value, fallback) {
+  var allowed = [1, 2, 4, 6, 8, 12];
+  var n = Number(value);
+  if (allowed.indexOf(n) !== -1) {
+    return n;
+  }
   var best = fallback;
   var bestDiff = 999;
   for (var i = 0; i < allowed.length; i++) {
