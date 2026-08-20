@@ -48,13 +48,75 @@ Example: the script authorized while signed into `school@example.edu` should use
 6. **Set** `ACCOUNT_ID`, `ACCOUNT_EMAIL`, and `CONTROL_SHEET_ID` in `Config.gs`.
 7. **Authorize** Gmail and Google Sheets permissions when Apps Script prompts you.
 8. **Run `setupSystem()`** from the editor (select function → Run). This creates tabs: `Accounts`, `Messages`, `Commands`, `Audit_Log`, `Settings`, and installs triggers.
-9. **Run a dry-run test** via `runDryRunTest()`. Confirm `Commands` / `Audit_Log` update and that Gmail is unchanged. **`DRY_RUN` defaults to TRUE** so live mutations are off until you opt in.
-10. **Confirm the time-driven triggers** exist (Triggers in the left sidebar): `processPendingCommands` (~every 5 min) and `scheduledMessageSync` (~every 15 min). `setupSystem()` already installs them; use `recreateTriggers()` / `removeAllTriggers()` to change them.
-11. **Repeat steps 4–10 for every additional Gmail account** (new Apps Script project while signed into that account, same code, different `ACCOUNT_ID` / `ACCOUNT_EMAIL`).
-12. **Share the control Sheet** with every account that needs to execute commands (Edit access).
-13. **Inspect Audit_Log**, then set `DRY_RUN` to **FALSE** in the Settings tab. Test one harmless `MARK_READ` command for each account before enabling archive/trash. Keep `TRASH_ENABLED=FALSE` until you are ready.
+9. **Run `runInitialSync()` once** to backfill recent messages (larger one-time pull). Do **not** repeatedly run full/manual syncs afterward.
+10. **Run a dry-run test** via `runDryRunTest()`. Confirm `Commands` / `Audit_Log` update and that Gmail is unchanged. **`DRY_RUN` defaults to TRUE** so live mutations are off until you opt in.
+11. **Confirm the time-driven triggers** exist (Triggers in the left sidebar): `processPendingCommands` (~every 5 min), `scheduledMessageSync` (~every 30 min), and `scheduledMessageReconciliation` (~every 6 hours). `setupSystem()` already installs them; use `recreateTriggers()` / `removeAllTriggers()` to change them.
+12. **Repeat steps 4–11 for every additional Gmail account** (new Apps Script project while signed into that account, same code, different `ACCOUNT_ID` / `ACCOUNT_EMAIL`).
+13. **Share the control Sheet** with every account that needs to execute commands (Edit access).
+14. **Inspect Audit_Log**, then set `DRY_RUN` to **FALSE** in the Settings tab. Test one harmless `MARK_READ` command for each account before enabling archive/trash. Keep `TRASH_ENABLED=FALSE` until you are ready.
 
 Optional: [clasp](https://github.com/google/clasp) users can push from `apps-script/` after `clasp login` / `clasp create` / linking the script project.
+
+### Upgrading an existing deployment
+
+You do **not** need to recreate the shared Sheet. In each Apps Script project:
+
+1. Paste/replace the updated `.gs` files (keep your edited `ACCOUNT_*` / `CONTROL_SHEET_ID` values).
+2. Run **`setupSystem()`** — migrates missing Settings keys and Commands columns (`retry_count`, `next_retry_at`) without overwriting your current setting values or destroying existing data.
+3. Run **`recreateTriggers()`** — removes obsolete/duplicate triggers and installs the quota-efficient schedule (30‑minute sync + 6‑hour reconciliation).
+4. Optionally run **`runInitialSync()`** once if Messages looks thin; otherwise let scheduled sync catch up.
+
+---
+
+## Gmail quota posture (read this)
+
+Apps Script Gmail daily quotas are easy to exhaust. This project is intentionally conservative in steady state:
+
+| Workload | Old default | New default |
+|---|---|---|
+| Scheduled message sync | every **15** min, up to **200** msgs + up to **200** reconcile lookups | every **30** min, up to **75** priority/incremental msgs, **no** broad reconcile |
+| Background reconciliation | bundled into every sync | separate trigger every **~6 hours**, **25** rows/run, cursor progresses |
+| Initial / backfill | same path as scheduled sync | **`runInitialSync()`** once (up to `INITIAL_MAX_MESSAGES_PER_SYNC`, default 200) |
+
+**Do not** repeatedly run `syncRecentMessages` / `SYNC_NOW` / `runInitialSync` “just to refresh” — that burns quota. Prefer waiting for `scheduledMessageSync`, or enqueue a targeted `REFRESH_MESSAGE` / `FETCH_FULL_TEXT` for one id.
+
+### What scheduled sync does
+
+1. Searches a small priority/incremental set (inbox / unread / starred, plus mail newer than the last successful sync).
+2. Upserts those messages into **Messages** (snippet metadata; no full-body reads under `SNIPPET_ONLY`).
+3. Does **not** individually re-fetch hundreds of old rows.
+
+### What reconciliation does
+
+`scheduledMessageReconciliation` (or manual `reconcileMessageState`) walks existing Messages rows in batches of `MAX_RECONCILE_PER_SYNC`, advancing a PropertiesService cursor so later rows are covered over successive runs. Use this for detecting mail archived/trashed/moved directly in Gmail — not as part of every 30‑minute sync.
+
+### Quota errors → `RETRY_LATER`
+
+If Gmail returns daily quota / rate-limit / temporary service errors (e.g. `Service invoked too many times for one day: gmail`):
+
+- The command is marked **`RETRY_LATER`** (not permanent `FAILED`).
+- `error` text is preserved; an **Audit_Log** row is written.
+- `retry_count` increments and `next_retry_at` is set with backoff (default **30m → 2h → 6h+**).
+- The processor only reclaims `RETRY_LATER` rows when `next_retry_at <= now`.
+- Terminal validation failures (bad `account_id`, missing `label_name`, ambiguous search, etc.) stay **`FAILED`** / **`NEEDS_REVIEW`**.
+
+If scheduled sync itself hits quota, it logs, stops cleanly, does **not** mark existing Messages as `REMOVED`, and preserves the last successful sync timestamp.
+
+### Quota-related Settings
+
+| Setting | Default | Notes |
+|---|---|---|
+| `SYNC_POLL_MINUTES` | 30 | Steady-state sync cadence (Apps Script: 1/5/10/15/30) |
+| `MAX_MESSAGES_PER_SYNC` | 75 | Cap per scheduled/steady-state sync |
+| `INITIAL_MAX_MESSAGES_PER_SYNC` | 200 | Cap for `runInitialSync` only |
+| `MAX_RECONCILE_PER_SYNC` | 25 | Cap per reconciliation run |
+| `RECONCILE_INTERVAL_HOURS` | 6 | Reconciliation cadence (Apps Script: 1/2/4/6/8/12) |
+| `RETRY_BACKOFF_MINUTES_1/2/3` | 30 / 120 / 360 | `RETRY_LATER` backoff ladder |
+| `BODY_SYNC_POLICY` | `SNIPPET_ONLY` | Avoids full-body reads unless `FULL_TEXT` / `FETCH_FULL_TEXT` |
+
+Change values in the **Settings** tab, then run **`recreateTriggers()`** if you changed poll/reconcile intervals.
+
+**Snippet / attachments:** normal sync uses Advanced Gmail metadata for snippets and attachment filenames when available. It does **not** call `getPlainBody()` or `getAttachments()` on the `SNIPPET_ONLY` path. If metadata is unavailable, `snippet` may fall back to the subject and `attachment_names` may be empty while `has_attachments` stays conservative. Full body text is only loaded for `BODY_SYNC_POLICY=FULL_TEXT` or `FETCH_FULL_TEXT`.
 
 ---
 
@@ -82,23 +144,23 @@ Created automatically by `setupSystem()`:
 - **Messages** — synchronized metadata/content ChatGPT can inspect
 - **Commands** — actions ChatGPT wants executed
 - **Audit_Log** — immutable record of attempted/completed actions
-- **Settings** — runtime knobs (`DRY_RUN`, `TRASH_ENABLED`, sync windows, etc.)
+- **Settings** — runtime knobs (`DRY_RUN`, `TRASH_ENABLED`, sync windows, quota caps, etc.)
 
 ### Commands columns
 
-`command_id`, `created_at`, `account_id`, `action`, `gmail_message_id`, `gmail_thread_id`, `search_query`, `label_name`, `status`, `requested_by`, `processed_at`, `result`, `error`
+`command_id`, `created_at`, `account_id`, `action`, `gmail_message_id`, `gmail_thread_id`, `search_query`, `label_name`, `status`, `requested_by`, `processed_at`, `result`, `error`, `retry_count`, `next_retry_at`
 
 **Mutation actions:** `LABEL`, `REMOVE_LABEL`, `ARCHIVE`, `MOVE_TO_INBOX`, `MARK_READ`, `MARK_UNREAD`, `STAR`, `UNSTAR`, `TRASH`
 
 **Infrastructure actions:** `SYNC_NOW`, `REFRESH_MESSAGE`, `FETCH_FULL_TEXT`, `CLEAR_FULL_TEXT`
 
-**Statuses:** `PENDING` → `PROCESSING` → `SUCCESS` | `FAILED` | `NEEDS_REVIEW`
+**Statuses:** `PENDING` → `PROCESSING` → `SUCCESS` | `FAILED` | `NEEDS_REVIEW` | `RETRY_LATER`
 
 ### Messages columns
 
 `sync_id`, `account_id`, `account_email`, `gmail_message_id`, `gmail_thread_id`, `received_at`, `from_address`, `to_addresses`, `cc_addresses`, `subject`, `snippet`, `body_text`, `body_text_expires_at`, `labels`, `is_unread`, `is_starred`, `has_attachments`, `attachment_names`, `last_synced_at`, `sync_state`
 
-Default sync: last **30 days**, priority Inbox/unread/starred, body policy **`SNIPPET_ONLY`**, no attachment binaries. ChatGPT can request `FETCH_FULL_TEXT` for one message when needed. Stored full text expires automatically after **24 hours** (`FULL_TEXT_TTL_HOURS`) even without `CLEAR_FULL_TEXT`.
+Default sync: priority Inbox/unread/starred plus incremental window, body policy **`SNIPPET_ONLY`**, no attachment binaries. ChatGPT can request `FETCH_FULL_TEXT` for one message when needed. Stored full text expires automatically after **24 hours** (`FULL_TEXT_TTL_HOURS`) even without `CLEAR_FULL_TEXT`.
 
 ### Action scope (read this before enqueueing commands)
 
@@ -111,7 +173,7 @@ GmailApp is thread-oriented for some operations. A command may name one `gmail_m
 | `LABEL`, `REMOVE_LABEL` | **thread** | Every message in that thread receives/loses the label |
 | `ARCHIVE`, `MOVE_TO_INBOX` | **thread** | The whole thread leaves or re-enters Inbox |
 
-Do not tell the user that `LABEL`/`ARCHIVE` apply to “this one message” when the thread has multiple messages. Command results and `Audit_Log.scope` record `message` or `thread`.
+Do not tell the user that `LABEL`/`ARCHIVE` apply to “this one message” when the thread has multiple messages. Command results and `Audit_Log.scope` record `message` or `thread`. After mutations, Apps Script refreshes **only** the affected message (or thread’s messages) — not the whole mailbox.
 
 ---
 
@@ -126,6 +188,7 @@ Do not tell the user that `LABEL`/`ARCHIVE` apply to “this one message” when
 | Permanent delete | never | Out of scope |
 | Ambiguous `search_query` | NEEDS_REVIEW | Will not guess among multiple matches |
 | Idempotency | enforced | `SUCCESS` commands never run twice |
+| Gmail quota errors | RETRY_LATER | Deferred with backoff; not permanent FAILED |
 | Locking | LockService | Prevents double execution |
 
 Credentials, OAuth tokens, and secrets are **never** stored in the Sheet.
@@ -140,14 +203,14 @@ Typical conversation flow:
 2. ChatGPT reads the **Messages** tab (across `account_id` values).
 3. If a snippet is not enough, ChatGPT writes a `FETCH_FULL_TEXT` command for that `gmail_message_id`.
 4. You approve actions like “archive these newsletters in school” — ChatGPT writes explicit **Commands** rows with `account_id` + `gmail_message_id` (preferred) or a narrow `search_query`.
-5. Each account’s Apps Script polls and executes only its rows; results land in `Commands` + `Audit_Log`; the next sync updates **Messages**.
+5. Each account’s Apps Script polls and executes only its rows; results land in `Commands` + `Audit_Log`; targeted refresh updates **Messages**.
 
 See `docs/chatgpt-workflow.md` for prompt patterns and column mapping.
 
 Safe onboarding sequence:
 
 1. Install each account and run `setupSystem()`.
-2. Let sync populate **Messages** (or enqueue `SYNC_NOW`).
+2. Run `runInitialSync()` once, then let scheduled sync keep Messages fresh (or enqueue occasional `SYNC_NOW` sparingly).
 3. Issue test commands while `DRY_RUN=TRUE`.
 4. Inspect **Audit_Log**.
 5. Explicitly set `DRY_RUN=FALSE` in Settings before live mutations.
@@ -162,13 +225,14 @@ If you already ran `setupSystem()` when `DRY_RUN` defaulted to FALSE, set Settin
 
 | Function | Purpose |
 |---|---|
-| `setupSystem` | Create tabs + install triggers |
+| `setupSystem` | Create/migrate tabs + install triggers |
+| `runInitialSync` | One-time / backfill sync (larger cap) |
 | `runDryRunTest` | Safe end-to-end harness |
 | `runCommandProcessorOnce` | Process pending commands now |
-| `runMessageSyncOnce` / `syncPriorityMessages` / `syncRecentMessages` | Sync now |
-| `reconcileMessageState` | Refresh label/read/star; mark missing as `REMOVED` |
+| `runMessageSyncOnce` / `syncPriorityMessages` / `syncRecentMessages` | Steady-state sync now |
+| `reconcileMessageState` / `scheduledMessageReconciliation` | Bounded reconcile with cursor |
 | `seedSampleCommands` | Insert sample PENDING rows |
-| `recreateTriggers` / `removeAllTriggers` | Manage triggers |
+| `recreateTriggers` / `removeAllTriggers` | Manage triggers (run after Settings interval changes) |
 
 Sample CSV rows: `samples/sample_commands.csv`.
 
@@ -190,6 +254,8 @@ Sample CSV rows: `samples/sample_commands.csv`.
 - [ ] `FETCH_FULL_TEXT` fills only the requested message’s `body_text`  
 - [ ] Stored full text expires (or is cleared) without relying on ChatGPT to remember `CLEAR_FULL_TEXT`  
 - [ ] `LABEL`/`ARCHIVE` results state they are thread-level  
+- [ ] Scheduled sync stays within `MAX_MESSAGES_PER_SYNC` and does not broad-reconcile  
+- [ ] Gmail quota errors become `RETRY_LATER` with backoff, not permanent `FAILED`  
 - [ ] No OpenAI API key anywhere in the project  
 
 ---
@@ -217,5 +283,6 @@ samples/              Sample command rows
 1. **Phase 1** — Reliable `LABEL`, `ARCHIVE`, `MARK_READ`, `MARK_UNREAD`, `MOVE_TO_INBOX`
 2. **Phase 2** — Safer `TRASH`, batch caps, auditing, error recovery, `REMOVE_LABEL` / `STAR` / `UNSTAR`
 3. **Phase 3 + bidirectional bridge** — Messages sync, infra commands, dual triggers, ChatGPT Sheet workflow
+4. **Quota efficiency** — Conservative scheduled sync, separate reconciliation, `RETRY_LATER` backoff
 
 Design principle: **ChatGPT decides; the shared Sheet communicates; Apps Script executes; each original Gmail account remains authoritative.**

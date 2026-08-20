@@ -15,7 +15,9 @@ var COMMAND_HEADERS = [
   'requested_by',
   'processed_at',
   'result',
-  'error'
+  'error',
+  'retry_count',
+  'next_retry_at'
 ];
 
 function ensureCommandsSheet_(ss) {
@@ -31,9 +33,10 @@ function ensureCommandsSheet_(ss) {
 var STALE_PROCESSING_MS = 15 * 60 * 1000;
 
 /**
- * Claim up to maxCount PENDING commands for this account_id.
- * Uses status transition PENDING -> PROCESSING for idempotency.
+ * Claim up to maxCount PENDING or eligible RETRY_LATER commands for this account_id.
+ * Uses status transition → PROCESSING for idempotency.
  * SUCCESS / FAILED / NEEDS_REVIEW are never re-executed.
+ * RETRY_LATER is reclaimed only when next_retry_at <= now.
  * Stale PROCESSING rows (crash recovery) may be reclaimed once.
  */
 function claimPendingCommands_(accountId, maxCount) {
@@ -46,7 +49,8 @@ function claimPendingCommands_(accountId, maxCount) {
 
   var headerMap = headerIndexMap_(sheet);
   var numRows = dataRowCount_(lastRow);
-  var range = sheet.getRange(2, 1, numRows, COMMAND_HEADERS.length);
+  var colCount = Math.max(COMMAND_HEADERS.length, sheet.getLastColumn());
+  var range = sheet.getRange(2, 1, numRows, colCount);
   var values = range.getValues();
   var claimed = [];
   var now = new Date().getTime();
@@ -61,6 +65,13 @@ function claimPendingCommands_(accountId, maxCount) {
     }
 
     var eligible = status === CONFIG.STATUS.PENDING;
+    if (!eligible && status === CONFIG.STATUS.RETRY_LATER) {
+      var nextRetryRaw = obj.next_retry_at;
+      var nextRetry = nextRetryRaw ? new Date(nextRetryRaw).getTime() : 0;
+      if (!nextRetryRaw || isNaN(nextRetry) || nextRetry <= now) {
+        eligible = true;
+      }
+    }
     if (!eligible && status === CONFIG.STATUS.PROCESSING) {
       var processedAt = obj.processed_at ? new Date(obj.processed_at).getTime() : NaN;
       if (!isNaN(processedAt) && now - processedAt > STALE_PROCESSING_MS) {
@@ -109,7 +120,8 @@ function markCommandSuccess_(rowNumber, resultText) {
     status: CONFIG.STATUS.SUCCESS,
     processed_at: nowIso_(),
     result: truncate_(resultText || 'OK', 2000),
-    error: ''
+    error: '',
+    next_retry_at: ''
   });
 }
 
@@ -118,7 +130,8 @@ function markCommandFailed_(rowNumber, errorText) {
     status: CONFIG.STATUS.FAILED,
     processed_at: nowIso_(),
     result: '',
-    error: truncate_(errorText || 'Unknown error', 2000)
+    error: truncate_(errorText || 'Unknown error', 2000),
+    next_retry_at: ''
   });
 }
 
@@ -127,8 +140,27 @@ function markCommandNeedsReview_(rowNumber, detail) {
     status: CONFIG.STATUS.NEEDS_REVIEW,
     processed_at: nowIso_(),
     result: '',
-    error: truncate_(detail || 'Needs review', 2000)
+    error: truncate_(detail || 'Needs review', 2000),
+    next_retry_at: ''
   });
+}
+
+/**
+ * Mark a command RETRY_LATER after a transient Gmail quota/rate-limit error.
+ * Preserves error text and schedules next_retry_at via backoff.
+ */
+function markCommandRetryLater_(rowNumber, errorText, previousRetryCount, runtime) {
+  var nextCount = (Number(previousRetryCount) || 0) + 1;
+  var nextAt = computeNextRetryAt_(nextCount, runtime);
+  updateCommandRow_(rowNumber, {
+    status: CONFIG.STATUS.RETRY_LATER,
+    processed_at: nowIso_(),
+    result: '',
+    error: truncate_(errorText || 'Retry later', 2000),
+    retry_count: nextCount,
+    next_retry_at: nextAt
+  });
+  return { retry_count: nextCount, next_retry_at: nextAt };
 }
 
 /**
@@ -150,7 +182,9 @@ function appendCommand_(command) {
     requested_by: command.requested_by || 'ChatGPT',
     processed_at: command.processed_at || '',
     result: command.result || '',
-    error: command.error || ''
+    error: command.error || '',
+    retry_count: command.retry_count != null ? command.retry_count : 0,
+    next_retry_at: command.next_retry_at || ''
   };
   sheet.appendRow(objectToRow_(row, COMMAND_HEADERS));
   return row.command_id;
