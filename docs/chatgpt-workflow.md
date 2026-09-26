@@ -17,7 +17,7 @@ If a thread has five messages and the user says “label this message,” write 
 
 ## Reading (triage)
 
-1. Ensure each account’s Apps Script has been syncing (`scheduledMessageSync` or a `SYNC_NOW` command). Scheduled sync also reconciles rows that left Inbox (archived/trashed) so **Messages** does not stay stale.
+1. Ensure each account’s Apps Script has been syncing (`scheduledMessageSync`, or a one-time `runInitialSync` after install). Prefer waiting for the 30‑minute scheduled sync over repeatedly enqueueing `SYNC_NOW` (that burns Gmail quota). Archive/trash state drift is caught by the separate ~6‑hour `scheduledMessageReconciliation`, not every sync.
 2. In ChatGPT (with Sheets/Drive connected to the control spreadsheet), ask e.g. “Check all my inboxes and tell me what needs action.”
 3. ChatGPT should group by `account_id` / `account_email` from the **Messages** tab.
 4. If a snippet is insufficient, ChatGPT appends a **Commands** row:
@@ -50,8 +50,9 @@ Rules of thumb for ChatGPT:
 ## Checking results
 
 - **Commands.status** / **result** / **error** for per-command outcomes (look for `[thread-level]` vs `[message-level]`).
+- Status may be **`RETRY_LATER`** when Gmail quota/rate-limit temporarily blocks execution — wait for `next_retry_at` rather than re-enqueueing the same command.
 - **Audit_Log** for every attempted mutation (including dry-run); `scope` is `message`, `thread`, or `infra`.
-- Re-read **Messages** after sync/reconcile to confirm labels/read/archive state (`INBOX` / `ARCHIVED` / `TRASH` tags in `labels`).
+- Re-read **Messages** after the targeted post-mutation refresh (or the next scheduled sync/reconcile) to confirm labels/read/archive state (`INBOX` / `ARCHIVED` / `TRASH` tags in `labels`).
 
 ## Example user phrases
 

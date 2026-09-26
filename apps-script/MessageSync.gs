@@ -4,7 +4,9 @@
  * READ PATH: Original Gmail → this deployment → Messages tab → ChatGPT
  *
  * Each deployment synchronizes ONLY the Gmail account that authorized it.
- * Defaults minimize data: recent window, SNIPPET_ONLY body policy, no attachments.
+ * Defaults minimize data and Gmail quota use: modest caps, SNIPPET_ONLY body
+ * policy (no full-body reads), no attachment binary downloads, no broad
+ * reconciliation on every scheduled sync.
  *
  * FETCH_FULL_TEXT is temporary: body_text is cleared automatically after
  * FULL_TEXT_TTL_HOURS (default 24) even if ChatGPT never sends CLEAR_FULL_TEXT.
@@ -93,14 +95,37 @@ function flushMessageIndex_(index) {
 }
 
 /**
- * Sync the configured recent Gmail window for this account.
+ * One-time / backfill sync for the configured lookback window.
+ * Uses INITIAL_MAX_MESSAGES_PER_SYNC (larger than steady-state).
+ * Does not run broad reconciliation — use scheduledMessageReconciliation or
+ * reconcileMessageState for that.
+ * @param {boolean=} optSkipLock true when the caller already holds the script lock
+ */
+function runInitialSync(optSkipLock) {
+  assertDeploymentIdentityConfigured_();
+  var runtime = getRuntimeConfig_();
+  var query = buildLookbackQuery_(runtime.SYNC_LOOKBACK_DAYS, 'in:anywhere');
+  var max = runtime.INITIAL_MAX_MESSAGES_PER_SYNC || runtime.MAX_MESSAGES_PER_SYNC || 200;
+  return runMessageSync_('runInitialSync', query, runtime, !!optSkipLock, max, true);
+}
+
+/**
+ * Sync the configured recent Gmail window for this account (manual / SYNC_NOW).
+ * Uses MAX_MESSAGES_PER_SYNC. Prefer runInitialSync for first-time backfill.
  * @param {boolean=} optSkipLock true when the caller already holds the script lock
  */
 function syncRecentMessages(optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
   var query = buildLookbackQuery_(runtime.SYNC_LOOKBACK_DAYS, 'in:anywhere');
-  return runMessageSync_('syncRecentMessages', query, runtime, !!optSkipLock);
+  return runMessageSync_(
+    'syncRecentMessages',
+    query,
+    runtime,
+    !!optSkipLock,
+    runtime.MAX_MESSAGES_PER_SYNC,
+    true
+  );
 }
 
 /**
@@ -110,11 +135,15 @@ function syncRecentMessages(optSkipLock) {
 function syncPriorityMessages(optSkipLock) {
   assertDeploymentIdentityConfigured_();
   var runtime = getRuntimeConfig_();
-  var query = buildLookbackQuery_(
-    runtime.SYNC_LOOKBACK_DAYS,
-    'in:inbox OR is:unread OR is:starred'
+  var query = buildSteadyStateSyncQuery_(runtime);
+  return runMessageSync_(
+    'syncPriorityMessages',
+    query,
+    runtime,
+    !!optSkipLock,
+    runtime.MAX_MESSAGES_PER_SYNC,
+    true
   );
-  return runMessageSync_('syncPriorityMessages', query, runtime, !!optSkipLock);
 }
 
 /**
@@ -236,6 +265,8 @@ function clearStoredBodyText(messageId, optSkipLock) {
 /**
  * Update labels/read/star/archive/trash state for this account's Messages rows
  * that still exist in Gmail. Marks missing messages as REMOVED (does not delete rows).
+ * Bounded by MAX_RECONCILE_PER_SYNC; progresses a PropertiesService cursor so
+ * successive runs walk through later rows instead of always starting at row 1.
  * @param {boolean=} optSkipLock
  */
 function reconcileMessageState(optSkipLock) {
@@ -255,7 +286,13 @@ function reconcileMessageState(optSkipLock) {
     if (index.values.length === 0) {
       return 'No message rows to reconcile';
     }
-    var result = reconcileUnseenRows_(index, {}, runtime, runtime.MAX_RECONCILE_PER_SYNC || 200);
+    var result = reconcileUnseenRows_(
+      index,
+      {},
+      runtime,
+      runtime.MAX_RECONCILE_PER_SYNC || 25,
+      true
+    );
     expireFullTextInIndex_(index, runtime);
     flushMessageIndex_(index);
     pruneOldMessageRows_(sheet, runtime);
@@ -265,7 +302,10 @@ function reconcileMessageState(optSkipLock) {
       ', marked_removed=' +
       result.removed +
       ', expired_bodies=' +
-      result.expiredBodies
+      result.expiredBodies +
+      ', cursor=' +
+      result.nextCursor +
+      (result.quotaAborted ? ' (stopped early: Gmail quota)' : '')
     );
   } finally {
     releaseLock_(lock);
@@ -273,12 +313,21 @@ function reconcileMessageState(optSkipLock) {
 }
 
 /**
- * Internal sync runner used by syncRecentMessages / syncPriorityMessages
- * and the scheduled trigger. After upserting matches, reconciles existing
- * rows that fell out of the query (archived/trashed/moved) so ChatGPT does
- * not keep seeing stale Inbox state.
+ * Internal sync runner used by syncRecentMessages / syncPriorityMessages /
+ * scheduledMessageSync / runInitialSync.
+ *
+ * Intentionally does NOT call reconcileUnseenRows_. Broad reconciliation is
+ * reserved for scheduledMessageReconciliation / reconcileMessageState so
+ * normal sync stays cheap and bounded.
+ *
+ * @param {string} label
+ * @param {string} query
+ * @param {Object} runtime
+ * @param {boolean} skipLock
+ * @param {number=} maxOverride
+ * @param {boolean=} recordSuccess whether to update last-successful-sync timestamp
  */
-function runMessageSync_(label, query, runtime, skipLock) {
+function runMessageSync_(label, query, runtime, skipLock, maxOverride, recordSuccess) {
   var lock = null;
   if (!skipLock) {
     lock = acquireLock_(30000);
@@ -291,53 +340,74 @@ function runMessageSync_(label, query, runtime, skipLock) {
     var sheet = ensureMessagesSheet_(ss);
     var index = loadMessageIndex_(sheet);
 
-    var max = runtime.MAX_MESSAGES_PER_SYNC || 200;
-    var threads = GmailApp.search(query, 0, Math.min(max, 500));
-    var seenIds = {};
+    var max = maxOverride != null ? maxOverride : runtime.MAX_MESSAGES_PER_SYNC || 75;
     var upserts = 0;
+    var quotaAborted = false;
 
-    for (var t = 0; t < threads.length; t++) {
-      var messages = threads[t].getMessages();
-      for (var m = 0; m < messages.length; m++) {
+    try {
+      var threads = GmailApp.search(query, 0, Math.min(max, 500));
+      var seenIds = {};
+
+      for (var t = 0; t < threads.length; t++) {
+        var messages = threads[t].getMessages();
+        for (var m = 0; m < messages.length; m++) {
+          if (upserts >= max) {
+            break;
+          }
+          var msg = messages[m];
+          var id = msg.getId();
+          if (seenIds[id]) {
+            continue;
+          }
+          seenIds[id] = true;
+          upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY, index);
+          upserts++;
+        }
         if (upserts >= max) {
           break;
         }
-        var msg = messages[m];
-        var id = msg.getId();
-        if (seenIds[id]) {
-          continue;
-        }
-        seenIds[id] = true;
-        upsertMessageRow_(msg, runtime, runtime.BODY_SYNC_POLICY, index);
-        upserts++;
       }
-      if (upserts >= max) {
-        break;
+    } catch (syncErr) {
+      if (isRetryableGmailError_(syncErr)) {
+        quotaAborted = true;
+        Logger.log(
+          label +
+            ': Gmail quota/rate-limit during sync — terminating cleanly without marking rows REMOVED. ' +
+            syncErr
+        );
+        // Flush any partial upserts already prepared; do not reconcile or advance last-sync.
+        expireFullTextInIndex_(index, runtime);
+        flushMessageIndex_(index);
+        return (
+          label +
+          ': aborted on Gmail quota after upserted=' +
+          upserts +
+          ' (query=' +
+          query +
+          ') — last successful sync timestamp preserved'
+        );
       }
+      throw syncErr;
     }
 
-    var recon = reconcileUnseenRows_(
-      index,
-      seenIds,
-      runtime,
-      runtime.MAX_RECONCILE_PER_SYNC || 200
-    );
     var expired = expireFullTextInIndex_(index, runtime);
     flushMessageIndex_(index);
     pruneOldMessageRows_(sheet, runtime);
+
+    if (recordSuccess !== false && !quotaAborted) {
+      setLastSuccessfulSyncAt_(runtime.ACCOUNT_ID, nowIso_());
+    }
 
     var summary =
       label +
       ': upserted ' +
       upserts +
-      ', reconciled_updated=' +
-      recon.updated +
-      ', marked_removed=' +
-      recon.removed +
       ', expired_bodies=' +
       expired +
       ' (query=' +
       query +
+      ', max=' +
+      max +
       ')';
     Logger.log(summary);
     return summary;
@@ -445,27 +515,56 @@ function expireFullTextInIndex_(index, runtime) {
 /**
  * Refresh this account's existing Messages rows that were not just upserted.
  * Updates archive/inbox/label/read state; marks gone mail as REMOVED.
+ *
+ * When useCursor is true (scheduled / manual reconcile), starts at the persisted
+ * cursor and advances it so successive runs cover later rows, wrapping around.
+ * Quota errors abort without marking remaining rows REMOVED.
+ *
+ * @param {Object} index
+ * @param {Object} seenIds message ids to skip
+ * @param {Object} runtime
+ * @param {number} cap max Gmail lookups this run
+ * @param {boolean=} useCursor progress PropertiesService cursor
  */
-function reconcileUnseenRows_(index, seenIds, runtime, cap) {
+function reconcileUnseenRows_(index, seenIds, runtime, cap, useCursor) {
   var headerMap = index.headerMap;
   var updated = 0;
   var removed = 0;
   var lookups = 0;
   var skipped = 0;
+  var quotaAborted = false;
 
-  for (var i = 0; i < index.values.length; i++) {
-    var obj = rowToObject_(index.values[i], headerMap);
-    if (String(obj.account_id || '').trim() !== runtime.ACCOUNT_ID) {
+  var accountOffsets = [];
+  for (var scan = 0; scan < index.values.length; scan++) {
+    var scanObj = rowToObject_(index.values[scan], headerMap);
+    if (String(scanObj.account_id || '').trim() !== runtime.ACCOUNT_ID) {
       continue;
     }
-    var mid = String(obj.gmail_message_id || '').trim();
-    if (!mid || seenIds[mid]) {
+    var mid0 = String(scanObj.gmail_message_id || '').trim();
+    if (!mid0 || (seenIds && seenIds[mid0])) {
       continue;
     }
+    accountOffsets.push(scan);
+  }
+
+  var startPos = 0;
+  if (useCursor && accountOffsets.length > 0) {
+    var stored = getReconcileCursor_(runtime.ACCOUNT_ID);
+    startPos = stored % accountOffsets.length;
+  }
+
+  var visited = 0;
+  while (visited < accountOffsets.length) {
     if (lookups >= cap) {
-      skipped++;
-      continue;
+      skipped += accountOffsets.length - visited;
+      break;
     }
+    var pos = (startPos + visited) % accountOffsets.length;
+    var i = accountOffsets[pos];
+    visited++;
+
+    var obj = rowToObject_(index.values[i], headerMap);
+    var mid = String(obj.gmail_message_id || '').trim();
     lookups++;
     try {
       var msg = GmailApp.getMessageById(mid);
@@ -483,6 +582,17 @@ function reconcileUnseenRows_(index, seenIds, runtime, cap) {
       index.dirty = true;
       updated++;
     } catch (err) {
+      if (isRetryableGmailError_(err)) {
+        quotaAborted = true;
+        Logger.log(
+          'reconcileUnseenRows_: Gmail quota/rate-limit — stopping without marking remaining rows REMOVED. ' +
+            err
+        );
+        // Do not advance past the current position so this row is retried later.
+        visited--;
+        break;
+      }
+      // Non-retryable load failure (e.g. truly gone) → REMOVED
       index.values[i][headerMap.sync_state] = CONFIG.SYNC_STATE.REMOVED;
       index.values[i][headerMap.last_synced_at] = nowIso_();
       index.dirty = true;
@@ -490,15 +600,54 @@ function reconcileUnseenRows_(index, seenIds, runtime, cap) {
     }
   }
 
-  return { updated: updated, removed: removed, skipped: skipped, expiredBodies: 0 };
+  var nextCursor = 0;
+  if (accountOffsets.length > 0) {
+    if (quotaAborted) {
+      nextCursor = (startPos + Math.max(0, visited)) % accountOffsets.length;
+    } else if (lookups >= cap && visited < accountOffsets.length) {
+      nextCursor = (startPos + visited) % accountOffsets.length;
+    } else {
+      // Completed a full pass (or emptied the set) — wrap to start
+      nextCursor = 0;
+    }
+    if (useCursor) {
+      setReconcileCursor_(runtime.ACCOUNT_ID, nextCursor);
+    }
+  } else if (useCursor) {
+    setReconcileCursor_(runtime.ACCOUNT_ID, 0);
+  }
+
+  return {
+    updated: updated,
+    removed: removed,
+    skipped: skipped,
+    expiredBodies: 0,
+    nextCursor: nextCursor,
+    quotaAborted: quotaAborted,
+    lookups: lookups
+  };
 }
 
+/**
+ * Build a Messages-tab snapshot without unnecessary GmailApp body/attachment reads.
+ *
+ * SNIPPET_ONLY / NONE: prefer Advanced Gmail metadata for snippet + attachment
+ * flags (no getPlainBody / getAttachments). FULL_TEXT still uses getPlainBody.
+ * Attachment filenames are filled from Advanced Gmail part metadata when cheap;
+ * otherwise has_attachments may be set without names.
+ */
 function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
   var thread = msg.getThread();
-  var attachments = msg.getAttachments({ includeInlineImages: false, includeAttachments: true });
-  var attachmentNames = attachments.map(function (a) {
-    return a.getName();
-  });
+  var policy = (bodyPolicy || runtime.BODY_SYNC_POLICY || 'SNIPPET_ONLY').toUpperCase();
+  var messageId = msg.getId();
+
+  var meta = fetchGmailMessageMetadata_(messageId);
+  var attachmentInfo = attachmentInfoFromMetadata_(meta);
+  if (!attachmentInfo.resolved) {
+    // Do not call msg.getAttachments() during normal sync — expensive GmailApp quota.
+    // Preserve empty names; has_attachments stays FALSE unless metadata said otherwise.
+    attachmentInfo = { has_attachments: false, attachment_names: '', resolved: false };
+  }
 
   var labels = [];
   if (thread) {
@@ -524,7 +673,6 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
 
   var bodyText = '';
   var expiresAt = '';
-  var policy = (bodyPolicy || runtime.BODY_SYNC_POLICY || 'SNIPPET_ONLY').toUpperCase();
   if (policy === 'FULL_TEXT') {
     try {
       bodyText = truncate_(msg.getPlainBody() || '', 50000);
@@ -537,18 +685,14 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
 
   var snippet = '';
   if (policy !== 'NONE') {
-    try {
-      snippet = truncate_(msg.getPlainBody() || msg.getSubject() || '', 500);
-    } catch (err) {
-      snippet = truncate_(msg.getSubject() || '', 200);
-    }
+    snippet = snippetFromMetadataOrSubject_(meta, msg);
   }
 
   return {
-    sync_id: makeSyncId_(runtime.ACCOUNT_ID, msg.getId()),
+    sync_id: makeSyncId_(runtime.ACCOUNT_ID, messageId),
     account_id: runtime.ACCOUNT_ID,
     account_email: runtime.ACCOUNT_EMAIL,
-    gmail_message_id: msg.getId(),
+    gmail_message_id: messageId,
     gmail_thread_id: thread ? thread.getId() : '',
     received_at: msg.getDate() ? msg.getDate().toISOString() : '',
     from_address: msg.getFrom() || '',
@@ -561,11 +705,74 @@ function buildMessageSnapshot_(msg, runtime, bodyPolicy) {
     labels: normalizeLabelList_(labels),
     is_unread: boolToSheet_(msg.isUnread()),
     is_starred: boolToSheet_(msg.isStarred()),
-    has_attachments: boolToSheet_(attachmentNames.length > 0),
-    attachment_names: attachmentNames.join(', '),
+    has_attachments: boolToSheet_(!!attachmentInfo.has_attachments),
+    attachment_names: attachmentInfo.attachment_names || '',
     last_synced_at: nowIso_(),
     sync_state: CONFIG.SYNC_STATE.ACTIVE
   };
+}
+
+/**
+ * Advanced Gmail metadata fetch (snippet + payload filenames, no body data).
+ * Returns null when the Advanced service is unavailable or the call fails.
+ */
+function fetchGmailMessageMetadata_(messageId) {
+  try {
+    if (typeof Gmail !== 'undefined' && Gmail.Users && Gmail.Users.Messages) {
+      return Gmail.Users.Messages.get('me', messageId, {
+        format: 'metadata',
+        metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Date']
+      });
+    }
+  } catch (err) {
+    if (isRetryableGmailError_(err)) {
+      throw err;
+    }
+    Logger.log('fetchGmailMessageMetadata_ fallback: ' + err);
+  }
+  return null;
+}
+
+function snippetFromMetadataOrSubject_(meta, msg) {
+  if (meta && meta.snippet) {
+    return truncate_(String(meta.snippet), 500);
+  }
+  // Avoid getPlainBody() — subject-only fallback preserves quota.
+  try {
+    return truncate_(msg.getSubject() || '', 200);
+  } catch (err) {
+    return '';
+  }
+}
+
+/**
+ * Walk Advanced Gmail payload parts for filenames without downloading bytes.
+ */
+function attachmentInfoFromMetadata_(meta) {
+  if (!meta || !meta.payload) {
+    return { has_attachments: false, attachment_names: '', resolved: false };
+  }
+  var names = [];
+  collectAttachmentFilenames_(meta.payload, names);
+  return {
+    has_attachments: names.length > 0,
+    attachment_names: names.join(', '),
+    resolved: true
+  };
+}
+
+function collectAttachmentFilenames_(part, out) {
+  if (!part) {
+    return;
+  }
+  var filename = part.filename ? String(part.filename).trim() : '';
+  if (filename) {
+    out.push(filename);
+  }
+  var parts = part.parts || [];
+  for (var i = 0; i < parts.length; i++) {
+    collectAttachmentFilenames_(parts[i], out);
+  }
 }
 
 /**
